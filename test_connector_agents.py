@@ -28,7 +28,7 @@ from connector_agents import (  # noqa: E402
     drop_uninteresting, face_for, normalize_status, read_agents,
     read_launchers, read_shortcuts, launcher_face, DEFAULT_LAUNCHERS,
     DEFAULT_SHORTCUTS, LAUNCHER_COLOR,
-    SOURCE_BADGE, STALE_WORKING_S, STATUS_FACE,
+    SOURCE_BADGE, STALE_WORKING_S, STATUS_FACE, STATUS_ORDER, slot_priority,
 )
 from connection_runtime import HealthReporter  # noqa: E402
 
@@ -628,6 +628,29 @@ def test_seen_marks_a_key_without_changing_its_status() -> None:
               seen["color"] != fresh["color"])
         check("a seen key is flagged for the renderers", seen["seen"] is True)
         check("a seen key is still pressable", 0 in c._agent_keys)
+
+
+def test_done_needs_attention_until_viewed() -> None:
+    """A completion is unread work, not a quiet historical state."""
+    agent = {
+        "name": "sample api", "status": "done", "source": "codex-cli",
+        "updated_at": 1.0,
+    }
+    fresh = face_for(agent, seen=False)
+    check("an unviewed completion says it needs you",
+          fresh["sublabel"] == "NEEDS YOU", fresh["sublabel"])
+    check("an unviewed completion uses the alert treatment",
+          fresh["effect"] == "breathe" and fresh["icon"] == "alert"
+          and fresh["color"] == STATUS_FACE["blocked"]["color"], str(fresh))
+    check("an unviewed completion has attention priority",
+          slot_priority(agent, seen=False) == STATUS_ORDER["blocked"])
+
+    viewed = face_for(agent, seen=True)
+    check("viewing reveals the quiet done state",
+          viewed["sublabel"] == "done" and viewed["effect"] == "solid"
+          and viewed["icon"] == "check-outline", str(viewed))
+    check("a viewed completion returns to done priority",
+          slot_priority(agent, seen=True) == STATUS_ORDER["done"])
 
 
 def test_seen_expires_when_the_agent_moves_on() -> None:
@@ -1313,6 +1336,7 @@ def main() -> int:
     test_a_shrinking_board_cannot_strand_the_operator()
     test_a_real_press_on_the_pager_turns_the_page()
     test_seen_marks_a_key_without_changing_its_status()
+    test_done_needs_attention_until_viewed()
     test_seen_expires_when_the_agent_moves_on()
     test_long_press_dismisses_and_short_press_focuses()
     test_long_press_reflows_survivors_before_launchers_return()

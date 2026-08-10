@@ -45,7 +45,7 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import websockets
 
@@ -97,6 +97,19 @@ STATUS_FACE = {
     "done": {"color": "#2e6fdb", "effect": "solid", "icon": "check"},
     "idle": {"color": "#1f8a4c", "effect": "solid", "icon": "idle"},
 }
+
+
+def slot_priority(agent: dict[str, Any], seen: bool = False) -> int:
+    """Rank a newcomer by whether the operator still owes it attention.
+
+    A completed result is actionable until it has been opened. Keep its real
+    ``done`` status in the feed, but let an unseen completion compete for a
+    scarce slot at the same priority as an explicit blocked/approval state.
+    """
+    status = agent.get("status", "idle")
+    if status == "done" and not seen:
+        return STATUS_ORDER["blocked"]
+    return STATUS_ORDER.get(status, 0)
 
 #: How far a seen key's colour is pulled down.  Enough to read as answered at a
 #: glance, not so far that it looks disabled or off.
@@ -797,8 +810,13 @@ class SlotMap:
         ordered = sorted(self._slots, key=self._slots.get)
         self._slots = {agent_id: slot for slot, agent_id in enumerate(ordered)}
 
-    def assign(self, agents: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    def assign(
+        self,
+        agents: list[dict[str, Any]],
+        priority: Callable[[dict[str, Any]], int] | None = None,
+    ) -> dict[int, dict[str, Any]]:
         """Return {slot_index: agent} honouring existing pins."""
+        priority = priority or (lambda agent: slot_priority(agent, seen=True))
         present = {agent_key(a): a for a in agents}
 
         # Release slots whose agent is gone.
@@ -820,7 +838,7 @@ class SlotMap:
             a for key, a in present.items() if key not in self._slots
         ]
         newcomers.sort(
-            key=lambda a: (STATUS_ORDER.get(a["status"], 0), a.get("updated_at") or 0.0),
+            key=lambda a: (priority(a), a.get("updated_at") or 0.0),
             reverse=True,
         )
         free = [i for i in range(self.size) if i not in placed]
@@ -839,7 +857,9 @@ def face_for(agent: dict[str, Any], seen: bool = False) -> dict[str, Any]:
     shouting about it without pretending the session is gone.
     """
     status = agent["status"]
-    style = STATUS_FACE.get(status, STATUS_FACE["idle"])
+    needs_attention = status == "done" and not seen
+    visual_status = "blocked" if needs_attention else status
+    style = STATUS_FACE.get(visual_status, STATUS_FACE["idle"])
     color, effect, icon = style["color"], style["effect"], style["icon"]
     if seen:
         # Dim the colour rather than change it: the status must still be
@@ -852,7 +872,9 @@ def face_for(agent: dict[str, Any], seen: bool = False) -> dict[str, Any]:
     return {
         "label": agent["name"][:12],
         "sublabel": str(
-            agent.get("notice_label") or STATUS_TEXT.get(status, status)
+            agent.get("notice_label")
+            or (STATUS_TEXT["blocked"] if needs_attention
+                else STATUS_TEXT.get(status, status))
         )[:16],
         "badge": SOURCE_BADGE.get(agent.get("source", ""), ""),
         # Source id travels with the face so renderers can draw the product
@@ -1103,7 +1125,9 @@ class AgentConnector:
                     app, badge_counts.get(app.get("source", ""), 0))
                 self._launcher_keys[index] = app
 
-        placed = self._slots.assign(agents)
+        placed = self._slots.assign(
+            agents, priority=lambda agent: slot_priority(
+                agent, seen=self._is_seen(agent)))
 
         # Paging.  Every agent gets a stable global slot; the board shows one
         # window onto them.  A window is a key shorter than the claim whenever

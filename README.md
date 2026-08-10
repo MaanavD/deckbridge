@@ -12,6 +12,8 @@ tested without Stream Deck hardware.
 
 - Shows up to ten live agent sessions with working, waiting, done, and idle
   states.
+- Treats a completed result as “needs you” until its session has been opened;
+  viewed completions settle into the quiet done state.
 - Focuses the exact application tab or terminal pane instead of merely raising
   an app.
 - Reflows keys after sessions end or are dismissed.
