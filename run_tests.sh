@@ -17,6 +17,13 @@ ok=0
 bad=0
 failed_files=()
 
+excluded() {
+  case " ${DECKBRIDGE_TEST_EXCLUDE:-} " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 run_one() {  # run_one RUNNER FILE
   local out status timeout_seconds
   timeout_seconds=${DECKBRIDGE_TEST_TIMEOUT_SECONDS:-120}
@@ -40,11 +47,13 @@ run_one() {  # run_one RUNNER FILE
 
 for t in test_*.py; do
   [ -e "$t" ] || continue
+  if excluded "$t"; then printf 'skipping %-25s (environment)\n' "$t"; continue; fi
   run_one "$PY" "$t"
 done
 
 for t in test_*.sh; do
   [ -e "$t" ] || continue
+  if excluded "$t"; then printf 'skipping %-25s (environment)\n' "$t"; continue; fi
   run_one bash "$t"
 done
 

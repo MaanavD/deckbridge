@@ -13,6 +13,9 @@ jobs:
     timeout-minutes: 10
     env:
       DECKBRIDGE_TEST_TIMEOUT_SECONDS: "90"
+      # Process adoption needs a real per-user launchd/HID session. The full
+      # local release gate still runs this suite on an interactive Mac.
+      DECKBRIDGE_TEST_EXCLUDE: "test_startup.sh"
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

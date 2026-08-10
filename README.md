@@ -178,7 +178,9 @@ known sessions. See [PROTOCOL.md](PROTOCOL.md) for the wire protocol.
 The suite exercises the hub, reconnect behavior, session selection, verified
 focus, dynamic layout, Discord/Hermes parsing, startup lifecycle, rendering,
 and microphone press/release behavior. Some macOS integration checks require
-Accessibility permission and are intentionally separate from unit tests.
+Accessibility permission and are intentionally separate from unit tests. The
+hosted CI runner skips only `test_startup.sh`, whose process-adoption checks
+need a real per-user launchd/HID session; the local command runs it by default.
 
 ## Privacy and security
 
