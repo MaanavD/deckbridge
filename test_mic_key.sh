@@ -333,13 +333,13 @@ out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
     DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
     bash "$SCRIPT" --press)"
 check contains "$out" 'gesture=hold'
-check test "$(rg -c '^tap 63 function$' "$helper_log")" -eq 2
+check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 2
 check excludes "$(cat "$helper_log")" 'start-dictation'
 : > "$helper_log"
 DECKBRIDGE_MIC_HELPER="$fake_helper" \
 DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
 bash "$SCRIPT" --release >/dev/null
-check test "$(rg -c '^tap 63 function$' "$helper_log")" -eq 2
+check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 2
 
 : > "$helper_log"
 DECKBRIDGE_DICTATION_HOTKEY=fn,fn \
@@ -351,14 +351,14 @@ DECKBRIDGE_FAKE_NO_DICTATION_MENU=1 \
 DECKBRIDGE_MIC_HELPER="$fake_helper" \
 DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
 bash "$SCRIPT" --press >/dev/null
-check test "$(rg -c '^tap 63 function$' "$helper_log")" -eq 2
+check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 2
 : > "$helper_log"
 DECKBRIDGE_DICTATION_HOTKEY=fn,fn \
 DECKBRIDGE_FAKE_NO_DICTATION_MENU=1 \
 DECKBRIDGE_MIC_HELPER="$fake_helper" \
 DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
 bash "$SCRIPT" --release >/dev/null
-check test "$(rg -c '^tap 63 function$' "$helper_log")" -eq 2
+check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 2
 
 # Claude Code's hold mode maps to a real Space key-down/key-up pair.
 : > "$helper_log"

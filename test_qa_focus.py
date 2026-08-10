@@ -170,8 +170,10 @@ def test_harness_refuses_off_macos() -> None:
         # host is the corresponding assertion; do not drive the whole live QA
         # suite from this unit test.
         import qa_focus
+        problems = qa_focus.preflight()
         check("macOS is accepted as the real focus-test host",
-              not qa_focus.preflight(), str(qa_focus.preflight()))
+              not any(problem.startswith("not macOS") for problem in problems),
+              str(problems))
         check("the off-macOS refusal is not applicable on macOS", True)
         return
     clean = {k: v for k, v in os.environ.items() if k != "QA_FAKE_MACOS"}
