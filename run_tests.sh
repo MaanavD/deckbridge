@@ -18,8 +18,13 @@ bad=0
 failed_files=()
 
 run_one() {  # run_one RUNNER FILE
-  local out status
-  out=$("$1" "$2" 2>&1)
+  local out status timeout_seconds
+  timeout_seconds=${DECKBRIDGE_TEST_TIMEOUT_SECONDS:-120}
+  printf 'running %-26s\n' "$2"
+  # Keep one wedged macOS integration fixture from occupying a public runner
+  # for hours. Perl ships on macOS and preserves the alarm across exec.
+  out=$(/usr/bin/perl -e 'alarm shift; exec @ARGV' \
+    "$timeout_seconds" "$1" "$2" 2>&1)
   status=$?
   printf '%-34s %s\n' "$2" "$(printf '%s\n' "$out" | tail -1)"
   if [ "$status" -eq 0 ]; then
@@ -27,6 +32,7 @@ run_one() {  # run_one RUNNER FILE
   else
     bad=$((bad + 1))
     failed_files+=("$2")
+    [ "$status" -ne 142 ] || printf '    TIMEOUT after %ss\n' "$timeout_seconds"
     # Surface the actual failures rather than making the reader re-run it.
     printf '%s\n' "$out" | grep -E '^(FAIL|not ok)' | head -8 | sed 's/^/    /'
   fi

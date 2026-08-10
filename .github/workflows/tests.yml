@@ -10,6 +10,9 @@ permissions:
 jobs:
   test:
     runs-on: macos-latest
+    timeout-minutes: 10
+    env:
+      DECKBRIDGE_TEST_TIMEOUT_SECONDS: "90"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
