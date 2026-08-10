@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "deckbridge: Claude Code hook wiring for Stream Deck keys 5-9.",
+    "Merge the 'hooks' block below into ~/.claude/settings.json (user-wide) or a",
+    "project .claude/settings.json.  Replace REPLACE_ME with the absolute path to",
+    "your deckbridge checkout, for example /Users/example/Documents/deckbridge.",
+    "Every entry runs the SAME script; the shim decides the deck status from the",
+    "hook_event_name field Claude Code puts on stdin.",
+    "Labels are prefixed cc- so a Claude and a Codex session in the same folder",
+    "occupy two keys instead of overwriting one record.",
+    "Optional flags: --ttl 900   (seconds before a dead agent ages off the deck)",
+    "                --prefix '' (drop the cc- prefix)",
+    "Never add --print here: hook stdout is parsed by the agent."
+  ],
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/claude_shim.py"}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/claude_shim.py"}]}
+    ],
+    "PermissionRequest": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/claude_shim.py"}]}
+    ],
+    "Notification": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/claude_shim.py"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/claude_shim.py"}]}
+    ],
+    "StopFailure": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/claude_shim.py"}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/claude_shim.py"}]}
+    ]
+  }
+}

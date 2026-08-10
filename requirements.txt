@@ -1,0 +1,22 @@
+# deckbridge dependencies
+#
+# Emulator testing (browser virtual deck) needs ONLY this:
+# v14 changed the default asyncio client implementation; these connectors
+# construct their client before an event loop is running and use the legacy
+# protocol API exercised by the repository tests.
+websockets>=12,<14
+
+# For the PHYSICAL Stream Deck renderer, also install:
+#   pillow>=10
+#   streamdeck==0.9.5  # 0.9.8 imports Python 3.10 syntax; this venv is 3.9
+# plus the HID backend:  brew install hidapi   (macOS)
+#
+# CORNER LOGOS.  cairosvg was omitted here once and the result was not a
+# missing dependency error but silently lettered keys: logos.load() returns
+# None on ImportError and the renderer falls back to H/C/X/M/S.  A degrade
+# that quiet has to be prevented at the manifest, not at the call site.
+#   pillow>=10
+#   cairosvg>=2.7
+# cairosvg needs libcairo:  brew install cairo   (macOS)
+# Without it the deck still runs; the corner marks just become letters.
+# `python3 -c "import logos; print(logos.available())"` says which you have.

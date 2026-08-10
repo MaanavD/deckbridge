@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+*.log
+*_proof.png
+.run/
+deckbridge.conf
+apps.json
+*.local.json
+hw_*.png
+logos/nous.png
+.DS_Store
+.pytest_cache/
+build/
+dist/

@@ -1,0 +1,14 @@
+<svg width="28" height="28" viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Cursor's installed 3.14.7 product mark, reduced to a self-contained
+       white two-tone glyph so it stays legible on every Deckbridge status. -->
+  <g clip-path="url(#clip)">
+    <mask id="mask" style="mask-type:alpha" maskUnits="userSpaceOnUse" x="3" y="1" width="22" height="26">
+      <path d="M22.8416 1.387C23.4132 1.0062 24.1735 1.44515 24.1295 2.13055L22.6326 25.4656C22.5957 26.0405 21.8646 26.2609 21.5162 25.8022L15.0114 17.2395C14.8429 17.0177 14.5923 16.873 14.316 16.838L3.6481 15.486C3.07656 15.4136 2.9019 14.6703 3.38136 14.3509L22.8416 1.387Z" fill="#fff"/>
+    </mask>
+    <g mask="url(#mask)">
+      <path d="M1.791 15.278 24.239.457 14.681 17.012 1.791 15.278Z" fill="#fff"/>
+      <path d="M22.628 27.308 24.239.457 14.682 17.012 22.628 27.308Z" fill="#aaa"/>
+    </g>
+  </g>
+  <defs><clipPath id="clip"><rect width="21.5704" height="24.8889" fill="#fff" transform="translate(2.824 1.167)"/></clipPath></defs>
+</svg>

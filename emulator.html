@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>deckbridge · virtual Stream Deck</title>
+<style>
+  :root { --bg:#0b0d10; --case:#1a1d22; --gap:14px; }
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:
+      radial-gradient(1200px 600px at 50% -10%, #14181d 0%, var(--bg) 60%);
+      color:#e6e9ee; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .wrap { min-height:100%; display:flex; flex-direction:column; align-items:center;
+      justify-content:center; gap:20px; padding:28px; }
+  h1 { font-weight:600; font-size:15px; letter-spacing:.3px; margin:0; opacity:.7; }
+  .status { font-size:12px; opacity:.55; height:16px; }
+  .status.on { color:#37d67a; opacity:.95; }
+  .status.off { color:#e5533c; opacity:.95; }
+  .deck { background:linear-gradient(180deg,#20242b,#12151a); padding:20px;
+      border-radius:22px; box-shadow: 0 30px 80px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);
+      border:1px solid #2a2f37; }
+  .grid { display:grid; gap:var(--gap); }
+  .key { position:relative; border-radius:12px; aspect-ratio:1/1; width:92px;
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      background:#111; cursor:pointer; user-select:none; overflow:hidden;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,.06), 0 3px 6px rgba(0,0,0,.4);
+      transition: transform .05s ease, filter .12s ease; }
+  .key:active { transform: translateY(2px) scale(.97); }
+  /* The status mark is SVG art, not text, so it is sized in pixels and tinted
+     white to match the corner logo's weight. */
+  .key .icon { width:22px; height:22px; margin-bottom:4px;
+               filter:drop-shadow(0 1px 2px rgba(0,0,0,.5)); }
+  .key .label { font-size:13px; font-weight:650; text-align:center; padding:0 4px;
+      text-shadow:0 1px 2px rgba(0,0,0,.6); word-break:break-word; }
+  .key .sub { font-size:10px; opacity:.85; text-transform:uppercase; letter-spacing:.4px;
+      text-shadow:0 1px 2px rgba(0,0,0,.6); }
+  .key.off { background:#0d0f12 !important; box-shadow: inset 0 0 0 1px rgba(255,255,255,.03); }
+  .key.off .label,.key.off .sub,.key.off .icon { opacity:.12; }
+  /* Corner mark: which tool owns this agent. The real product logo, not a
+     letter -- a letter is only legible to someone who has memorised the
+     mapping. Corner placement leaves the tiny label free for the project
+     name. */
+  .key .logo { position:absolute; top:4px; right:5px; width:18px; height:18px;
+               filter: drop-shadow(0 1px 2px rgba(0,0,0,.9)); }
+  .key.logo-only .logo { top:50%; right:auto; left:50%; width:58px; height:58px;
+      transform:translate(-50%,-50%); filter:drop-shadow(0 2px 4px rgba(0,0,0,.65)); }
+  .key.icon-action .logo { top:43%; right:auto; left:50%; width:52px; height:52px;
+      transform:translate(-50%,-50%); filter:drop-shadow(0 2px 4px rgba(0,0,0,.65)); }
+  .key.icon-action .label { display:none; }
+  .key.icon-action .sub { position:absolute; left:2px; right:2px; bottom:7px;
+      font-size:9px; font-weight:700; opacity:1; }
+  .key.logo-only .badge { top:50%; right:auto; left:50%; transform:translate(-50%,-50%);
+      padding:0; background:transparent; font-size:34px; }
+  /* The Nous mark is a drawn face, not a single-path glyph: at 18px its
+     features collapse. Mirrors BADGE_PX_BY_SOURCE in renderer_hw.py. */
+  .key.mark-lg .logo { width:26px; height:26px; clip-path: inset(1px); }
+  .key.logo-only.mark-lg .logo { width:58px; height:58px; clip-path:none; }
+  .key.off .logo { opacity:.12; }
+  /* Letter badge, kept only for a source with no logo file. */
+  .key .badge { position:absolute; top:4px; right:5px; font-size:13px;
+                font-weight:900; line-height:1; padding:1px 5px; border-radius:5px;
+                background:rgba(0,0,0,.55); color:#fff;
+                letter-spacing:.5px; text-shadow:0 1px 2px rgba(0,0,0,.9); }
+  .key.off .badge { opacity:.12; }
+  /* An empty badge must draw nothing: the padded dark plate is visible even
+     with no text, which looked like a rendering bug on the mic key. */
+  .key .badge:empty { display:none; }
+  .key .notification { display:none; position:absolute; z-index:3; top:6px; right:6px;
+      min-width:22px; height:22px; padding:0 6px; border-radius:11px;
+      align-items:center; justify-content:center; color:white; background:#ff3b30;
+      border:1px solid #ff7d75; box-shadow:0 2px 5px rgba(0,0,0,.65);
+      font-size:12px; line-height:20px; font-weight:750; letter-spacing:-.2px; }
+  .idx { position:absolute; top:3px; left:5px; font-size:9px; opacity:.3; }
+  @keyframes breathe { 0%,100%{filter:brightness(.6)} 50%{filter:brightness(1.25)} }
+  @keyframes blink   { 0%,49%{filter:brightness(1)} 50%,100%{filter:brightness(.25)} }
+  @keyframes shimmer { from{transform:translateX(-160%) skewX(-18deg)}
+                       to{transform:translateX(260%) skewX(-18deg)} }
+  @keyframes status-spin { to { transform:rotate(360deg); } }
+  @keyframes claude-spark { 0%,100% { transform:rotate(-7deg); }
+                             50% { transform:rotate(7deg); } }
+  @keyframes codex-pulse { 0%,100% { transform:scale(.9); }
+                            50% { transform:scale(1); } }
+  @keyframes hermes-float { 0%,100% { transform:translateY(1px); }
+                             50% { transform:translateY(-1px); } }
+  .fx-breathe { animation: breathe 1.8s ease-in-out infinite; }
+  .fx-blink   { animation: blink 0.7s steps(1) infinite; }
+  .fx-shimmer::after { content:""; position:absolute; inset:-20%; pointer-events:none;
+      background:linear-gradient(90deg,transparent 35%,rgba(255,255,255,.28) 50%,transparent 65%);
+      animation:shimmer 1.65s ease-in-out infinite; }
+  /* The protocol stays semantic: effect says working, source selects the
+     restrained motion that fits the mark. No connector sends visual flags. */
+  .key.status-working .icon { animation:status-spin 1.05s linear infinite; }
+  .key.fx-shimmer.motion-claude .logo { animation:claude-spark 1.45s ease-in-out infinite; }
+  .key.fx-shimmer.motion-codex .logo { animation:codex-pulse 1.65s ease-in-out infinite; }
+  .key.fx-shimmer.motion-hermes .logo { animation:hermes-float 1.6s ease-in-out infinite; }
+  @media (prefers-reduced-motion: reduce) {
+    .key { transition: none; }
+    .fx-breathe, .fx-blink, .key.status-working .icon,
+    .key.fx-shimmer.motion-claude .logo,
+    .key.fx-shimmer.motion-codex .logo,
+    .key.fx-shimmer.motion-hermes .logo { animation: none !important; }
+    .fx-shimmer::after { display:none; animation: none !important; }
+  }
+  .legend { display:flex; gap:16px; font-size:11px; opacity:.6; flex-wrap:wrap; justify-content:center; max-width:560px; }
+  .legend span { display:inline-flex; align-items:center; gap:6px; }
+  .dot { width:10px; height:10px; border-radius:3px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>deckbridge · virtual Stream Deck</h1>
+  <div id="status" class="status">connecting…</div>
+  <div class="deck"><div id="grid" class="grid"></div></div>
+  <div class="legend">
+    <span><i class="dot" style="background:#c0392b"></i>needs you</span>
+    <span><i class="dot" style="background:#d9822b"></i>working</span>
+    <span><i class="dot" style="background:#2e6fdb"></i>done</span>
+    <span><i class="dot" style="background:#1f8a4c"></i>idle</span>
+    <span><i class="dot" style="background:#0d0f12;border:1px solid #333"></i>empty</span>
+  </div>
+</div>
+<script>
+// deckbridge-emulator-build: 2026-08-07.logo-motion
+// Probed by deckbridge.sh to tell THIS checkout's emulator from a stale
+// http.server left running in some other directory, which would otherwise
+// answer 404 (or worse, serve old JavaScript) and look like a broken deck.
+const params = new URLSearchParams(location.search);
+const WS = params.get("ws") || "ws://127.0.0.1:8777";
+const grid = document.getElementById("grid");
+const statusEl = document.getElementById("status");
+let keyEls = [], cols = 5;
+
+function build(keys, gridDims){
+  cols = gridDims ? gridDims[0] : 5;
+  grid.style.gridTemplateColumns = `repeat(${cols}, 92px)`;
+  grid.innerHTML = "";
+  keyEls = [];
+  for (let i=0;i<keys;i++){
+    const k = document.createElement("div");
+    k.className = "key off";
+    // Static skeleton: the only interpolation is the loop counter. Every value
+    // that comes off the wire is written with textContent or setAttribute
+    // below, never as markup.
+    k.innerHTML = `<span class="idx">${i}</span>
+      <img class="logo" alt="" hidden><span class="badge"></span><span class="notification"></span><img class="icon" alt="" hidden><span class="label"></span><span class="sub"></span>`;
+    k.addEventListener("mousedown", ()=>send({type:"press",index:i}));
+    k.addEventListener("mouseup",   ()=>send({type:"release",index:i}));
+    k.addEventListener("mouseleave",e=>{ if(e.buttons) send({type:"release",index:i}); });
+    grid.appendChild(k);
+    keyEls.push(k);
+  }
+}
+function paint(faces){
+  faces.forEach(f=>{
+    const k = keyEls[f.index]; if(!k) return;
+    const off = (f.effect==="off");
+    const bigMark = ["hermes-discord","hermes-ssh","hermes","nous"].includes(f.source);
+    const workingStatus = ["working","agent"].includes(f.icon);
+    const sourceMotion = f.source === "claude-code" ? " motion-claude" :
+      (["codex-cli","codex"].includes(f.source) ? " motion-codex" :
+      (bigMark ? " motion-hermes" : ""));
+    k.className = "key" + (off?" off":"") + (bigMark?" mark-lg":"") +
+      (f.layout==="logo-only"?" logo-only":"") +
+      (f.layout==="icon-action"?" icon-action":"") +
+      (workingStatus?" status-working":"") + sourceMotion +
+      (f.effect==="breathe"?" fx-breathe":"") + (f.effect==="blink"?" fx-blink":"") +
+      (f.effect==="shimmer"?" fx-shimmer":"");
+    k.style.background = off ? "" :
+      `linear-gradient(180deg, ${shade(f.color,1.15)}, ${shade(f.color,0.8)})`;
+    // Status icon. Real SVG art, matching the hardware renderer and the
+    // product logos beside it. This was an emoji lookup, which the system font
+    // drew however it liked -- so the emulator and the deck showed different
+    // pictures for the same state, and neither matched the logos.
+    const iconEl = k.querySelector(".icon");
+    if (f.icon) {
+      const isrc = `icons/${f.icon}.svg`;
+      iconEl.onerror = () => { iconEl.hidden = true; };
+      iconEl.hidden = false;
+      if (iconEl.getAttribute("src") !== isrc) iconEl.setAttribute("src", isrc);
+    } else {
+      iconEl.hidden = true;
+    }
+    // The logo FILENAME is sent by the connector rather than derived here, so
+    // the two renderers cannot disagree. Deriving `logos/<source>.svg` locally
+    // is exactly how the emulator missed the Nous mark: it is a .png, and the
+    // guessed .svg path 404'd straight into the letter fallback.
+    const logoEl = k.querySelector(".logo");
+    const badgeEl = k.querySelector(".badge");
+    const badgeText = f.badge || "";
+    const showBadge = () => {
+      logoEl.hidden = true;
+      badgeEl.textContent = badgeText;
+      badgeEl.style.display = badgeText ? "" : "none";
+    };
+    const file = f.logo || (f.source ? `${f.source}.svg` : "");
+    if (file) {
+      const src = `logos/${file}`;
+      logoEl.onerror = () => {
+        console.warn(`deckbridge: missing logo ${src} for source '${f.source}'`);
+        showBadge();
+      };
+      logoEl.onload = () => { badgeEl.style.display = "none"; };
+      logoEl.hidden = false;
+      badgeEl.style.display = "none";
+      if (logoEl.getAttribute("src") !== src) logoEl.setAttribute("src", src);
+    } else {
+      showBadge();
+    }
+    k.querySelector(".label").textContent = f.label || "";
+    k.querySelector(".sub").textContent   = f.sublabel || "";
+    const notificationEl = k.querySelector(".notification");
+    const notificationCount = Math.max(0, Number(f.notification_count) || 0);
+    notificationEl.textContent = notificationCount > 99 ? "99+" : String(notificationCount || "");
+    notificationEl.style.display = notificationCount ? "flex" : "none";
+  });
+}
+function shade(hex,mul){
+  if(!hex||hex[0]!=="#") return hex||"#111";
+  let r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+  r=Math.min(255,r*mul|0);g=Math.min(255,g*mul|0);b=Math.min(255,b*mul|0);
+  return `rgb(${r},${g},${b})`;
+}
+let ws;
+function send(o){ try{ ws && ws.readyState===1 && ws.send(JSON.stringify(o)); }catch(e){} }
+function connect(){
+  statusEl.textContent="connecting…"; statusEl.className="status";
+  ws = new WebSocket(WS);
+  ws.onopen = ()=>{ statusEl.textContent="● connected to deckd"; statusEl.className="status on";
+    send({type:"hello",role:"renderer",name:"html-emulator"}); };
+  ws.onclose= ()=>{ statusEl.textContent="○ disconnected — retrying"; statusEl.className="status off";
+    setTimeout(connect,1200); };
+  ws.onerror= ()=>{ try{ws.close();}catch(e){} };
+  ws.onmessage = ev=>{
+    const m = JSON.parse(ev.data);
+    if(m.type==="welcome"){ build(m.keys, m.grid); }
+    else if(m.type==="state"){ if(keyEls.length!==m.keys) build(m.keys,m.grid); paint(m.faces); }
+  };
+}
+build(15,[5,3]);
+connect();
+</script>
+</body>
+</html>

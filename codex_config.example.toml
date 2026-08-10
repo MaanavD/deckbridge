@@ -1,0 +1,64 @@
+# deckbridge: Codex CLI hook wiring, inline TOML form.
+#
+# Alternative to codex_hooks.example.json. Append to ~/.codex/config.toml and
+# replace REPLACE_ME with your deckbridge checkout path. Use ONE form per config
+# layer, not both: Codex merges hooks.json and inline [hooks] and warns.
+#
+# After installing, run /hooks inside Codex and TRUST these hooks. Codex records
+# trust against each hook's hash and silently skips untrusted hooks.
+#
+# Hooks are enabled by default in current Codex. If yours are off, set:
+#   [features]
+#   hooks = true
+# (On Codex 0.125.x the key was codex_hooks; it is now a deprecated alias.)
+#
+# Omitting `matcher` matches every occurrence of the event. Codex has no
+# SessionEnd event, so keys age off via the shim --ttl timer (default 900s).
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"
+
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"
+
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"
+
+[[hooks.SubagentStart]]
+[[hooks.SubagentStart.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"
+
+[[hooks.SubagentStop]]
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "REPLACE_ME/codex_shim.py"
+statusMessage = "deckbridge"

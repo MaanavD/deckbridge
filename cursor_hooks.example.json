@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {"command": "REPLACE_ME/cursor_shim.py --app Cursor"}
+    ],
+    "beforeSubmitPrompt": [
+      {"command": "REPLACE_ME/cursor_shim.py --app Cursor"}
+    ],
+    "afterAgentThought": [
+      {"command": "REPLACE_ME/cursor_shim.py --app Cursor"}
+    ],
+    "afterAgentResponse": [
+      {"command": "REPLACE_ME/cursor_shim.py --app Cursor"}
+    ],
+    "stop": [
+      {"command": "REPLACE_ME/cursor_shim.py --app Cursor"}
+    ],
+    "sessionEnd": [
+      {"command": "REPLACE_ME/cursor_shim.py --app Cursor"}
+    ]
+  }
+}

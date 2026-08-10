@@ -1,0 +1,33 @@
+# deckbridge.conf.example - copy to deckbridge.conf and edit.
+#
+#   cp deckbridge.conf.example deckbridge.conf
+#
+# This file is sourced by deckbridge.sh, so it is plain shell. Environment
+# variables of the same name override it, so one-off runs still work:
+#   HERMES_SSH=hetzner ./deckbridge.sh start
+#
+# Every setting is optional. Components whose config is missing are skipped
+# with a printed reason, not treated as errors.
+
+# --- ports and layout --------------------------------------------------------
+# WS_PORT=8777          # deckd hub WebSocket port
+# HTTP_PORT=8080        # emulator web server port
+# KEYS=15               # classic Stream Deck has 15 keys
+# AGENT_CLAIM="0 13"    # sessions 0-9, app shortcuts 10-13
+
+# --- remote Hermes agents on keys 1-4 ----------------------------------------
+# SSH alias for the box running Hermes. Must work non-interactively:
+#   ssh -o BatchMode=yes hetzner true
+# HERMES_SSH=hetzner
+
+# --- Discord approval key 0 --------------------------------------------------
+# The channel to watch for Hermes approval prompts.
+# The token is read from $DISCORD_BOT_TOKEN, else from ~/.hermes/.env. When
+# HERMES_SSH is set, the token and channel can also be discovered from the
+# remote ~/.hermes/.env without copying the token to this machine.
+# NEVER put the token in this file: it lives in the repo directory.
+# DISCORD_CHANNEL_ID=123456789012345678
+# DISCORD_GUILD_ID=123456789012345678
+
+# --- misc --------------------------------------------------------------------
+# OPEN_BROWSER=0        # do not auto-open the emulator on start

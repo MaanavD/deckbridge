@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "deckbridge: Codex CLI hook wiring for Stream Deck keys 5-9.",
+    "Merge the 'hooks' block into ~/.codex/hooks.json, then replace REPLACE_ME",
+    "with the absolute path to your deckbridge checkout.",
+    "AFTER installing, run /hooks inside Codex and TRUST these hooks. Codex",
+    "records trust against each hook's hash and silently skips untrusted hooks.",
+    "Omit 'matcher' to match every occurrence of an event.",
+    "Codex has no SessionEnd event, so keys age off via the shim --ttl timer."
+  ],
+  "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ],
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ],
+    "PreToolUse": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ],
+    "PostToolUse": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ],
+    "PermissionRequest": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ],
+    "SubagentStart": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "REPLACE_ME/codex_shim.py", "statusMessage": "deckbridge"}]}
+    ]
+  }
+}
