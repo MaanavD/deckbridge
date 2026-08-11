@@ -18,6 +18,7 @@ import asyncio
 import json
 import math
 import os
+import subprocess
 import sys
 import time
 import unittest
@@ -212,6 +213,63 @@ class TestRendererBadgeSize(unittest.TestCase):
             self.skipTest("renderer_hw unavailable")
         for source in ("claude-code", "codex-cli", "cursor-agent", "cmux"):
             self.assertEqual(renderer_hw.badge_px(source), renderer_hw.BADGE_PX)
+
+
+class TestHardwareDisplayPower(unittest.TestCase):
+    class Deck:
+        def __init__(self):
+            self.events = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def reset(self):
+            self.events.append("reset")
+
+        def set_brightness(self, value):
+            self.events.append(("brightness", value))
+
+        def close(self):
+            self.events.append("close")
+
+    def test_ioreg_root_lock_state_is_detected(self):
+        import renderer_hw
+        completed = mock.Mock(stdout=b'  "IOConsoleLocked" = Yes\n')
+        with mock.patch.object(sys, "platform", "darwin"), mock.patch.object(
+            subprocess, "run", return_value=completed
+        ):
+            self.assertTrue(renderer_hw.macos_session_locked())
+
+    def test_lock_blanks_once_and_unlock_repaints_latest_state(self):
+        import renderer_hw
+        states = iter((True, True, False))
+        r = renderer_hw.HWRenderer(
+            "ws://unused", 45, session_locked=lambda: next(states))
+        deck = self.Deck()
+        r.deck = deck
+        repaints = []
+        r.push_all = lambda phase: repaints.append(phase)
+
+        self.assertTrue(r.refresh_display_power())
+        self.assertEqual(deck.events, ["reset", ("brightness", 0)])
+        self.assertFalse(r.refresh_display_power(), "locked polling rewrote HID")
+        self.assertEqual(deck.events, ["reset", ("brightness", 0)])
+
+        self.assertTrue(r.refresh_display_power())
+        self.assertEqual(deck.events[-1], ("brightness", 45))
+        self.assertEqual(len(repaints), 1)
+
+    def test_shutdown_blanks_before_closing(self):
+        import renderer_hw
+        r = renderer_hw.HWRenderer("ws://unused", 45)
+        deck = self.Deck()
+        r.deck = deck
+        r.blank_and_close()
+        self.assertEqual(
+            deck.events, ["reset", ("brightness", 0), "close"])
 
 
 class TestDependencyManifest(unittest.TestCase):

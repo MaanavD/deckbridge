@@ -21,6 +21,8 @@ tested without Stream Deck hardware.
 - Supports unread badges for Slack, Gmail, Discord, and Notion Calendar.
 - Uses the final key as press-and-hold dictation for the frontmost supported
   app.
+- Blanks the physical deck and sets its brightness to zero while macOS is
+  locked, then restores the latest frame immediately on unlock.
 - Reconnects feeds independently so a slow focus operation cannot block later
   button presses.
 - Runs at login through a per-user macOS LaunchAgent.

@@ -33,8 +33,11 @@ import asyncio
 from contextlib import suppress
 import json
 import math
+import signal
+import subprocess
+import sys
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import websockets
 
@@ -78,6 +81,7 @@ LOGO_ONLY_PX = 46
 ANIMATION_FPS = 12
 SLOW_EFFECT_DIVISOR = 3
 DEVICE_RETRY_SECONDS = 2.0
+POWER_POLL_SECONDS = 0.5
 HARDWARE_LABEL_CHARS = 11
 
 
@@ -104,6 +108,29 @@ def hex_to_rgb(h: str):
 
 def dim(rgb, mul):
     return tuple(max(0, min(255, int(c * mul))) for c in rgb)
+
+
+def macos_session_locked() -> bool:
+    """Return whether the active macOS console session is screen-locked.
+
+    ``IOConsoleLocked`` is the root registry property macOS itself updates on
+    lock/unlock. Restrict the query to Root and match that exact property. A
+    failed probe is treated as unlocked: transient inspection failure must not
+    strand an awake user's deck in darkness.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/ioreg", "-n", "Root", "-d", "1", "-l"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return b'"IOConsoleLocked" = Yes' in result.stdout
 
 
 def animate_logo_mark(logo, source: str, phase: float):
@@ -150,6 +177,7 @@ class HWRenderer:
     def __init__(
         self, ws_url: str, brightness: int,
         health: HealthReporter | None = None,
+        session_locked: Callable[[], bool] = macos_session_locked,
     ):
         self.ws_url = ws_url
         self.brightness = brightness
@@ -162,6 +190,9 @@ class HWRenderer:
         self._ws = None
         self._loop = None
         self._pressed_until = {}
+        self._session_locked = session_locked
+        self._display_suspended = False
+        self._next_power_check = 0.0
         self.health = health
 
     # ---- device --------------------------------------------------------
@@ -174,13 +205,50 @@ class HWRenderer:
         self.deck = visual[0]
         self.deck.open()
         self.deck.reset()
-        self.deck.set_brightness(self.brightness)
+        self._display_suspended = self._session_locked()
+        self.deck.set_brightness(0 if self._display_suspended else self.brightness)
         self.key_size = self.deck.key_image_format()["size"]
         self._load_fonts()
         print(f"[hw] opened {self.deck.deck_type()} "
               f"serial={self.deck.get_serial_number()} keys={self.deck.key_count()} "
               f"keysize={self.key_size}")
         return self.deck
+
+    def set_display_suspended(self, suspended: bool) -> bool:
+        """Blank/restore the physical deck; return whether state changed."""
+        suspended = bool(suspended)
+        if suspended == self._display_suspended:
+            return False
+        self._display_suspended = suspended
+        deck = self.deck
+        if deck is None:
+            return True
+        with deck:
+            if suspended:
+                deck.reset()
+                deck.set_brightness(0)
+            else:
+                deck.set_brightness(self.brightness)
+        if not suspended:
+            # State may have changed while writes were suppressed. Repaint the
+            # complete latest frame immediately instead of waiting for deckd.
+            self.push_all(time.time())
+        return True
+
+    def refresh_display_power(self) -> bool:
+        """Apply the current macOS lock state to the physical display."""
+        return self.set_display_suspended(self._session_locked())
+
+    def blank_and_close(self) -> None:
+        """Leave no stale illuminated frame when the renderer exits."""
+        if self.deck is None:
+            return
+        with suppress(Exception):
+            with self.deck:
+                self.deck.reset()
+                self.deck.set_brightness(0)
+        with suppress(Exception):
+            self.deck.close()
 
     def _load_fonts(self):
         # Try a few common fonts; fall back to PIL default (still renders).
@@ -385,7 +453,7 @@ class HWRenderer:
         return img
 
     def push_all(self, phase: float = 1.0):
-        if not self.deck:
+        if not self.deck or self._display_suspended:
             return
         self.push_indices(range(min(self.deck.key_count(), len(self.faces))), phase)
 
@@ -397,7 +465,7 @@ class HWRenderer:
         Animation ticks use this narrower seam to avoid rewriting fourteen
         static keys because one agent is working.
         """
-        if not self.deck:
+        if not self.deck or self._display_suspended:
             return
         from StreamDeck.ImageHelpers import PILHelper
         n = min(self.deck.key_count(), len(self.faces))
@@ -413,7 +481,7 @@ class HWRenderer:
 
     # ---- press callback ------------------------------------------------
     def _on_key(self, deck, key, state):
-        if self._ws is None or self._loop is None:
+        if self._display_suspended or self._ws is None or self._loop is None:
             return
         kind = "press" if state else "release"
         self._pressed_until[key] = time.monotonic() + (0.16 if state else 0.08)
@@ -537,6 +605,13 @@ class HWRenderer:
                 )
             tick += 1
             now = time.monotonic()
+            if now >= getattr(self, "_next_power_check", float("inf")):
+                self._next_power_check = now + POWER_POLL_SECONDS
+                await asyncio.to_thread(self.refresh_display_power)
+            if getattr(self, "_display_suspended", False):
+                # Keep health heartbeats alive while the Mac is locked, but do
+                # no HID animation writes until unlock restores one full frame.
+                continue
             indices = {
                 i for i, face in enumerate(self.faces)
                 if face.get("effect") == "shimmer"
@@ -575,13 +650,17 @@ def main():
         args.ws, args.brightness,
         health=HealthReporter("renderer_hw", stale_after=20.0),
     )
+    def stop_cleanly(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_cleanly)
+    signal.signal(signal.SIGHUP, stop_cleanly)
     try:
         asyncio.run(r.run())
     except KeyboardInterrupt:
-        if r.deck:
-            with r.deck:
-                r.deck.reset()
-                r.deck.close()
+        pass
+    finally:
+        r.blank_and_close()
 
 
 if __name__ == "__main__":
