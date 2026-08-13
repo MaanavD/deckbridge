@@ -460,6 +460,35 @@ def test_merges_native_desktop_surfaces() -> None:
         check("native desktop surface keeps its exact focus identity",
               (Path(tmp) / "focus").read_text(encoding="utf-8").strip() == "Claude|chat-1")
 
+
+def test_t3_managed_provider_children_are_not_separate_buttons() -> None:
+    """T3's Claude/Codex subprocess hooks are implementation detail, not tabs."""
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        local, t3 = root / "local.json", root / "t3.json"
+        write(local, [
+            {"name": "cx-Test2", "status": "done", "source": "codex-cli",
+             "session_id": "provider-session", "app": "T3 Code (Alpha)",
+             "updated_at": now},
+            {"name": "cx-Generate", "status": "done", "source": "codex-cli",
+             "session_id": "title-worker", "app": "T3 Code (Alpha)",
+             "updated_at": now},
+        ])
+        write(t3, [{
+            "name": "Test2", "status": "done", "source": "t3code-codex",
+            "session_id": "thread-1", "thread_id": "thread-1",
+            "app": "T3 Code (Alpha)", "updated_at": now,
+        }])
+        connector = AgentConnector(
+            hermes_state=root / "none.json", local_state=local,
+            desktop_state=root / "desktop.json", t3code_state=t3,
+        )
+        found = connector.collect(now)
+        check("T3 provider subprocesses collapse into their authoritative thread",
+              [(a["source"], a["name"]) for a in found]
+              == [("t3code-codex", "Test2")], str(found))
+
 async def _noop_send(message: dict[str, Any]) -> None:
     """Swallow publishes in tests that only care about side effects."""
     return None
@@ -1424,6 +1453,7 @@ def main() -> int:
     test_idle_and_old_are_dropped()
     test_merges_both_feeds()
     test_merges_native_desktop_surfaces()
+    test_t3_managed_provider_children_are_not_separate_buttons()
     test_pager_replaces_the_dead_overflow_key()
     test_every_agent_is_reachable_by_paging()
     test_paging_wraps_and_keeps_slots_still()

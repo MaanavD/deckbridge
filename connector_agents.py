@@ -93,6 +93,7 @@ DEFAULT_MAX_AGE_HOURS = 24.0
 STALE_WORKING_S = 300.0
 LIVENESS_CACHE_S = 5.0
 LOCAL_SESSION_SOURCES = frozenset({"claude-code", "codex-cli", "cursor-agent"})
+T3CODE_HOST_APPS = frozenset({"t3 code", "t3 code (alpha)"})
 
 VALID_STATUSES = ("blocked", "working", "done", "idle")
 STATUS_ORDER = {"idle": 0, "done": 1, "working": 2, "blocked": 3}
@@ -373,6 +374,18 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
             "updated_at": updated_at,
         })
     return agents
+
+
+def is_t3_managed_provider_child(agent: dict[str, Any]) -> bool:
+    """Return whether a hook record is an internal provider owned by T3.
+
+    T3 launches real Claude/Codex/Cursor processes, so global hooks observe
+    them. Their provider session IDs are not T3 thread IDs and cannot navigate
+    the T3 UI; rendering them duplicates the authoritative T3 thread and makes
+    a press merely raise the host app. The owning app is the precise boundary.
+    """
+    app = str(agent.get("app") or "").strip().casefold()
+    return app in T3CODE_HOST_APPS and agent.get("source") in LOCAL_SESSION_SOURCES
 
 
 def read_viewed(path: Path) -> list[dict[str, str]]:
@@ -1176,7 +1189,10 @@ class AgentConnector:
                     # arbitrary transport errors can never turn into links.
                     "url": auth_url.group(0) if auth_url is not None else "",
                 })
-        local = read_agents(self.local_state, source_default="cmux")
+        local = [
+            agent for agent in read_agents(self.local_state, source_default="cmux")
+            if not is_t3_managed_provider_child(agent)
+        ]
         agents += reconcile_local_liveness(local, self.liveness_probe)
         # Native desktop conversations do not have a child CLI PID to probe.
         # Their watcher renews only while an Accessibility-visible app window
@@ -1452,10 +1468,16 @@ end run
             return
         log.info("focus: %s", command)
         try:
-            subprocess.run(
-                command, shell=True, check=False,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+            result = subprocess.run(
+                command, shell=True, check=False, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15,
             )
+            detail = (result.stdout or "").strip()
+            if result.returncode != 0:
+                log.warning("focus exited %s for %s: %s", result.returncode,
+                            agent.get("name"), detail or "no detail")
+            elif detail:
+                log.info("focus result for %s: %s", agent.get("name"), detail)
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("focus failed for %s: %s", agent.get("name"), exc)
 

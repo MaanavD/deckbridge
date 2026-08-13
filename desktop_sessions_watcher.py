@@ -87,13 +87,11 @@ def parse_helper_lines(
             continue
         window, title, url = parts
         session = route_id(url, prefixes)
-        exact = bool(session)
-        # Several Electron builds intentionally hide their renderer route from
-        # AX. An actual app window is still a live surface worth returning to;
-        # its opaque window id is scoped to this scan and deliberately does not
-        # trigger an unsupported deep link during focus.
         if not session:
-            session = f"window-{window}"
+            # A window without a conversation identity cannot be selected
+            # exactly. App-only buttons are indistinguishable from a launcher
+            # and routinely raise the wrong tab, so they are not agent sessions.
+            continue
         if session in seen:
             continue
         seen.add(session)
@@ -105,7 +103,7 @@ def parse_helper_lines(
             # fallback: Deckbridge presents an unseen result as NEEDS YOU and
             # marks it seen when focused. Hammerspoon supplies exact live state
             # for Claude on the target Mac and replaces this fallback below.
-            "status": "working" if exact else "done",
+            "status": "working",
             "source": source,
             "session_id": session,
             "app": app,
@@ -113,7 +111,7 @@ def parse_helper_lines(
             "url": url,
             "updated_at": now,
             "desktop_surface": True,
-            "exact_route": exact,
+            "exact_route": True,
         })
     return records
 
@@ -128,11 +126,13 @@ def parse_hammerspoon_snapshot(text: str, now: float) -> list[dict[str, object]]
     if not isinstance(raw, list):
         return []
     records: list[dict[str, object]] = []
-    for index, item in enumerate(raw):
+    for item in raw:
         if not isinstance(item, dict):
             continue
         url = str(item.get("url") or "").strip()
-        session = route_id(url, SURFACES[0][3]) or f"window-{index}"
+        session = route_id(url, SURFACES[0][3])
+        if not session:
+            continue
         title = compact_title(str(item.get("title") or ""), "Claude")
         if title.endswith(" - Claude"):
             title = title[:-9].strip() or "Claude"
@@ -147,7 +147,7 @@ def parse_hammerspoon_snapshot(text: str, now: float) -> list[dict[str, object]]
             "url": url,
             "updated_at": now,
             "desktop_surface": True,
-            "exact_route": not session.startswith("window-"),
+            "exact_route": True,
             "focused": bool(item.get("focused")),
         })
     return records
@@ -232,7 +232,7 @@ def scan(helper: str, now: float | None = None) -> list[dict[str, object]]:
             agents.extend(parse_helper_lines(result.stdout, source, app, prefixes, current))
     # Hammerspoon already has a durable Accessibility grant and sees Claude's
     # live status text ("responding" / "finished") plus its chat URL. Prefer
-    # that exact snapshot to the helper's window-only Claude fallback without
+    # that exact snapshot to the helper's route-bearing Claude records without
     # rebuilding the signed helper and invalidating its macOS privacy grant.
     claude = scan_hammerspoon(current)
     if claude:

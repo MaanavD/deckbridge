@@ -64,6 +64,46 @@ def launchctl(*args: str, check: bool = False) -> subprocess.CompletedProcess[st
     )
 
 
+def wait_for_supervisor_release() -> tuple[bool, str]:
+    """Wait until the unloaded generation finishes its EXIT cleanup.
+
+    ``launchctl bootout`` can return before the supervisor has stopped its
+    children and released the shared lifecycle lock. Replacing the runtime in
+    that gap deletes the old process's cwd; worse, its late cleanup reads the
+    shared pidfiles and terminates the newly bootstrapped generation.
+    """
+    lock = RUN_DIR / "launchd-supervisor.lock"
+    timeout = float(os.environ.get("DECKBRIDGE_UNLOAD_TIMEOUT", "10"))
+    interval = float(os.environ.get("DECKBRIDGE_UNLOAD_INTERVAL", "0.05"))
+    deadline = time.monotonic() + max(0.0, timeout)
+    while lock.exists():
+        try:
+            owner = int((lock / "pid").read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, ValueError, OSError):
+            owner = 0
+        owner_alive = False
+        if owner > 0:
+            try:
+                os.kill(owner, 0)
+                owner_alive = True
+            except ProcessLookupError:
+                owner_alive = False
+            except PermissionError:
+                owner_alive = True
+        if not owner_alive:
+            try:
+                (lock / "pid").unlink(missing_ok=True)
+                lock.rmdir()
+            except OSError:
+                pass
+            if not lock.exists():
+                return True, ""
+        if time.monotonic() >= deadline:
+            return False, f"supervisor cleanup did not finish within {timeout:g}s"
+        time.sleep(max(0.01, interval))
+    return True, ""
+
+
 def unload() -> tuple[bool, str]:
     """Unload the active generation without guessing about launchctl errors.
 
@@ -74,7 +114,7 @@ def unload() -> tuple[bool, str]:
     """
     result = launchctl("bootout", TARGET)
     if result.returncode == 0 or launchctl("print", TARGET).returncode != 0:
-        return True, ""
+        return wait_for_supervisor_release()
     detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
     return False, detail
 
@@ -203,6 +243,31 @@ def activate_runtime(stage: Path) -> None:
     shutil.rmtree(backup, ignore_errors=True)
 
 
+def refresh_hammerspoon_bridge() -> None:
+    """Refresh the optional, GUI-trusted Accessibility bridge after cutover."""
+    config = HOME / ".hammerspoon" / "init.lua"
+    installer = RUNTIME_ROOT / "install_hammerspoon_bridge.py"
+    module = RUNTIME_ROOT / "hammerspoon_deckbridge.lua"
+    hs = shutil.which("hs")
+    if not config.exists() or not installer.exists() or not module.exists() or not hs:
+        return
+    installed = subprocess.run(
+        [sys.executable, str(installer), "--config", str(config),
+         "--module", str(module)],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    )
+    if installed.returncode != 0:
+        print(f"warning: Hammerspoon bridge update failed: {installed.stdout.strip()}",
+              file=sys.stderr)
+        return
+    # The module is loaded with dofile, so replacing the generated runtime does
+    # not update the in-memory functions until Hammerspoon reloads its config.
+    subprocess.run(
+        [hs, "-c", "hs.reload()"], text=True, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
 def install_mic_helper(stage: Path) -> tuple[bool, str]:
     """Install the stable Accessibility identity outside generated runtime.
 
@@ -276,6 +341,7 @@ def install() -> int:
         shutil.rmtree(stage, ignore_errors=True)
         print(f"failed to activate Deckbridge runtime: {exc}", file=sys.stderr)
         return 1
+    refresh_hammerspoon_bridge()
     bootstrap_timeout = float(
         os.environ.get("DECKBRIDGE_BOOTSTRAP_TIMEOUT", "8")
     )

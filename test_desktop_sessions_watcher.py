@@ -29,9 +29,7 @@ def test_records() -> None:
         "0\tClaude\t\n", "claude-desktop", "Claude",
         watcher.SURFACES[0][3], 12.5,
     )
-    assert fallback[0]["session_id"] == "window-0"
-    assert fallback[0]["exact_route"] is False
-    assert fallback[0]["status"] == "done"
+    assert fallback == []
 
 
 def test_hammerspoon_snapshot() -> None:
@@ -50,7 +48,7 @@ def test_hammerspoon_snapshot() -> None:
     assert watcher.parse_hammerspoon_snapshot(
         '{"sessions":[{"title":"Claude","url":"",'
         '"status":"working"}]}', 20.0,
-    )[0]["status"] == "working"
+    ) == []
 
 
 def test_stable_event_timestamps() -> None:

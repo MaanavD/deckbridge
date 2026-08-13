@@ -1692,12 +1692,69 @@ deckbridge_control() {
 }
 
 focus_t3code() {
-  local selected polls
+  local selected polls attempts=0 title64 session64 request result_file
   command -v open >/dev/null 2>&1 || return 1
   open -a "T3 Code (Alpha)" >/dev/null 2>&1 || return 1
-  if deckbridge_control --helper-press-button com.t3tools.t3code "$NAME" >/dev/null 2>&1; then
+  # Prefer Hammerspoon's URL event bridge: LaunchServices delivers this to the
+  # Accessibility-trusted GUI app even when hs's CLI/XPC connection is denied
+  # to a LaunchAgent child. A request-scoped result file verifies the route.
+  if [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] \
+      && command -v base64 >/dev/null 2>&1; then
+    title64=$(printf '%s' "$NAME" | base64 | tr '+/' '-_' | tr -d '=\r\n')
+    request="$$-$(date +%s)"
+    result_file="$HOME/.deckbridge/t3-focus-results/$request"
+    rm -f "$result_file"
+    open -g -a Hammerspoon \
+      "hammerspoon://deckbridge-t3-focus?title=$title64&session=$SESSION&request=$request" \
+      >/dev/null 2>&1 || true
     polls=0
-    while [ "$polls" -lt 20 ]; do
+    while [ "$polls" -lt 60 ]; do
+      if [ -f "$result_file" ]; then
+        selected=$(cat "$result_file" 2>/dev/null || true)
+        rm -f "$result_file"
+        case "$selected" in
+          *"/$SESSION"|*"/$SESSION/"*)
+            printf 'focus_agent: focused exact T3 Code thread %s via Hammerspoon (verified)\n' "$SESSION"
+            return 0
+            ;;
+        esac
+        break
+      fi
+      polls=$((polls + 1))
+      sleep 0.05
+    done
+  fi
+  # Retain the CLI path for interactive installations whose URL handler has
+  # not loaded yet. It is fast when available and preserves a graceful upgrade.
+  if [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] \
+      && command -v hs >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
+    title64=$(printf '%s' "$NAME" | base64 | tr -d '\r\n')
+    session64=$(printf '%s' "$SESSION" | base64 | tr -d '\r\n')
+    selected=$(hs -c "print(deckbridgeT3FocusB64('$title64','$session64'))" 2>/dev/null || true)
+    case "$selected" in
+      *"/$SESSION"|*"/$SESSION/"*)
+        printf 'focus_agent: focused exact T3 Code thread %s via Hammerspoon (verified)\n' "$SESSION"
+        return 0
+        ;;
+    esac
+  fi
+  # T3 hides the thread sidebar on Settings. Its native Back control restores
+  # the last thread and is absent on an ordinary thread, so this is a safe,
+  # idempotent preflight before selecting the exact requested title.
+  deckbridge_control --helper-press-button com.t3tools.t3code Back >/dev/null 2>&1 || true
+  sleep 0.05
+  # T3's Electron sidebar is briefly rebuilt after app activation, and AX can
+  # miss a button during that small window. Retry the exact titled control and
+  # verify its stable thread route after every successful click. We still fail
+  # closed: no title guess and no pairing-required browser fallback.
+  while [ "$attempts" -lt 3 ]; do
+    attempts=$((attempts + 1))
+    if ! deckbridge_control --helper-press-button com.t3tools.t3code "$NAME" >/dev/null 2>&1; then
+      sleep 0.1
+      continue
+    fi
+    polls=0
+    while [ "$polls" -lt 10 ]; do
       selected=$(deckbridge_control --helper-web-url com.t3tools.t3code 2>/dev/null || true)
       case "$selected" in
         *"/$SESSION"|*"/$SESSION/"*)
@@ -1708,7 +1765,7 @@ focus_t3code() {
       polls=$((polls + 1))
       sleep 0.05
     done
-  fi
+  done
   # The local HTTP route is not a safe fallback. Its browser client requires a
   # separate bootstrap pairing credential and cannot inherit the desktop-managed
   # session. Fail closed here instead of stranding the operator on a token prompt.

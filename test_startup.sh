@@ -134,6 +134,22 @@ check "install retries launchctl's transient post-bootout error" \
   env FAKE_BOOTSTRAP_FAIL_ONCE=1 DECKBRIDGE_STARTUP_INTERVAL=0.01 \
   "$INSTALLER" install
 
+# launchctl bootout can return before the old supervisor's EXIT trap finishes.
+# Replacing its cwd during that interval leaves getcwd errors, while the old
+# cleanup can kill the new generation through their shared pid directory.
+mkdir -p "$PERSISTENT_RUN/launchd-supervisor.lock"
+printf '%s\n' "$$" >"$PERSISTENT_RUN/launchd-supervisor.lock/pid"
+touch "$RUNTIME/old-supervisor-still-cleaning"
+overlap_out=$(DECKBRIDGE_UNLOAD_TIMEOUT=0.05 \
+  "$INSTALLER" install 2>&1)
+overlap_rc=$?
+check "install waits for the unloaded supervisor to release its lifecycle lock" \
+  test "$overlap_rc" -ne 0
+check "install preserves runtime while the old supervisor is still cleaning" \
+  test -e "$RUNTIME/old-supervisor-still-cleaning"
+rm -f "$PERSISTENT_RUN/launchd-supervisor.lock/pid"
+rmdir "$PERSISTENT_RUN/launchd-supervisor.lock"
+
 # A genuine unload failure must not let an update replace the runtime under a
 # still-running generation.
 touch "$RUNTIME/existing-generation"

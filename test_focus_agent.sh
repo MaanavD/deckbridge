@@ -141,9 +141,42 @@ check_sh 'T3 focus never opens its pairing-required browser route' \
    printf "#!/bin/sh\nexit 1\n" > "$TMP_DIR/t3-control";
    chmod +x "$TMP_DIR/bin/open" "$TMP_DIR/t3-control";
    PATH="$TMP_DIR/bin:$PATH"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-control";
+   DECKBRIDGE_DISABLE_HAMMERSPOON=1;
    NAME=missing; SESSION=thread-1; WEB_URL=http://127.0.0.1:3773/env/thread-1;
    ! focus_t3code;
    ! grep -q "http://" "$TMP_DIR/t3-opened"'
+
+check_sh 'T3 focus retries a transient native Accessibility miss' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   printf "#!/bin/sh\ncase \"\$1\" in\n  --helper-press-button) n=\$(cat \"$TMP_DIR/t3-tries\" 2>/dev/null || echo 0); n=\$((n+1)); echo \$n > \"$TMP_DIR/t3-tries\"; [ \$n -gt 1 ] ;;\n  --helper-web-url) echo t3code://app/\#/env/thread-1 ;;\nesac\n" > "$TMP_DIR/t3-retry-control";
+   chmod +x "$TMP_DIR/t3-retry-control";
+   PATH="$TMP_DIR/bin:$PATH"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-retry-control";
+   DECKBRIDGE_DISABLE_HAMMERSPOON=1; NAME=task; SESSION=thread-1; focus_t3code;
+   [ "$(cat "$TMP_DIR/t3-tries")" -eq 2 ]'
+
+check_sh 'T3 focus dismisses Settings before selecting the exact thread' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   printf "#!/bin/sh\necho \"\$*\" >> \"$TMP_DIR/t3-control-log\"\ncase \"\$1\" in\n  --helper-press-button) exit 0 ;;\n  --helper-web-url) echo t3code://app/\#/env/thread-1 ;;\nesac\n" > "$TMP_DIR/t3-settings-control";
+   chmod +x "$TMP_DIR/t3-settings-control";
+   PATH="$TMP_DIR/bin:$PATH"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-settings-control";
+   DECKBRIDGE_DISABLE_HAMMERSPOON=1; NAME=task; SESSION=thread-1; focus_t3code;
+   head -n 1 "$TMP_DIR/t3-control-log" | grep -q -- "--helper-press-button com.t3tools.t3code Back"'
+
+check_sh 'T3 focus uses the durable Hammerspoon Accessibility bridge' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   printf "#!/bin/sh\necho t3code://app/\#/env/thread-1\n" > "$TMP_DIR/bin/hs";
+   printf "#!/bin/sh\nexit 1\n" > "$TMP_DIR/t3-no-helper";
+   chmod +x "$TMP_DIR/bin/hs" "$TMP_DIR/t3-no-helper";
+   PATH="$TMP_DIR/bin:/usr/bin:/bin"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-no-helper";
+   NAME=task; SESSION=thread-1; focus_t3code'
+
+check_sh 'T3 focus verifies the LaunchServices Hammerspoon acknowledgement' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   mkdir -p "$TMP_DIR/url-home/.deckbridge/t3-focus-results";
+   printf "#!/bin/sh\ncase \"\$*\" in\n  *hammerspoon://*) u=\${!#}; q=\${u#*?}; session=\$(printf \"%%s\" \"\$q\" | tr \"&\" \"\\n\" | sed -n \"s/^session=//p\"); request=\$(printf \"%%s\" \"\$q\" | tr \"&\" \"\\n\" | sed -n \"s/^request=//p\"); mkdir -p \"\$HOME/.deckbridge/t3-focus-results\"; echo \"t3code://app/#/env/\$session\" > \"\$HOME/.deckbridge/t3-focus-results/\$request\" ;;\nesac\n" > "$TMP_DIR/bin/open";
+   chmod +x "$TMP_DIR/bin/open";
+   PATH="$TMP_DIR/bin:/usr/bin:/bin"; HOME="$TMP_DIR/url-home";
+   NAME=task; SESSION=thread-1; focus_t3code 2>&1 | grep -q "via Hammerspoon (verified)"'
 
 matcher() {
   FOCUS_AGENT_LIB_ONLY=1 bash -c ". \"$SCRIPT\"; ssh_pane_for_host \"\$1\" \"\$2\"" _ "$1" "$2"
