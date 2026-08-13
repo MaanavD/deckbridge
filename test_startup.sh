@@ -98,7 +98,10 @@ with open(path, "rb") as f:
 checks = {
     "label": p.get("Label") == "com.deckbridge.agent",
     "runner": p.get("ProgramArguments") == [runtime + "/deckbridge_launchd.sh"],
-    "cwd": p.get("WorkingDirectory") == runtime,
+    # The runtime directory is atomically replaced on every install. launchd
+    # must start the next generation from its stable parent or the shell can
+    # inherit a deleted cwd and fail before deckbridge_launchd.sh can cd.
+    "cwd": p.get("WorkingDirectory") == str(__import__("pathlib").Path(runtime).parent),
     "run": p.get("RunAtLoad") is True,
     "restart": p.get("KeepAlive", {}).get("SuccessfulExit") is False,
     "throttle": p.get("ThrottleInterval") == 10,

@@ -162,7 +162,12 @@ def plist() -> dict:
         "Label": LABEL,
         "Program": str(RUNTIME_ROOT / "deckbridge_launchd.sh"),
         "ProgramArguments": [str(RUNTIME_ROOT / "deckbridge_launchd.sh")],
-        "WorkingDirectory": str(RUNTIME_ROOT),
+        # The generated runtime is atomically replaced during every install.
+        # launchd may retain this cwd across the bootout/bootstrap boundary;
+        # pointing it inside the replaced tree can make the next shell start
+        # with ENOENT before deckbridge_launchd.sh gets a chance to cd to its
+        # own freshly resolved directory. Its parent is stable across cutover.
+        "WorkingDirectory": str(RUNTIME_ROOT.parent),
         "EnvironmentVariables": {
             "HOME": str(HOME),
             "PATH": path,

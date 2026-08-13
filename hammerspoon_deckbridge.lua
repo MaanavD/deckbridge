@@ -146,12 +146,15 @@ end
 local function clickT3Element(element)
     -- T3's Chromium controls advertise AXPress but currently ignore that
     -- action. A click at the exact Accessibility bounds works reliably and
-    -- does not require guessing coordinates or moving the visible pointer.
+    -- does not require guessing coordinates. Preserve the operator's pointer
+    -- position because eventtap emits a real click at the target bounds.
     local position = element:attributeValue("AXPosition")
     local size = element:attributeValue("AXSize")
     if not position or not size then return false end
+    local originalPosition = hs.mouse.absolutePosition()
     hs.eventtap.leftClick({x = position.x + size.w / 2,
                            y = position.y + size.h / 2})
+    hs.mouse.absolutePosition(originalPosition)
     return true
 end
 

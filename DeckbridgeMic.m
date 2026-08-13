@@ -315,6 +315,10 @@ static void press_unique_button(NSString *bundleID, NSString *title) {
     // thread URL, so a moved/stale element cannot be reported as success.
     CGPoint point = CGPointMake(position.x + size.width / 2.0,
                                 position.y + size.height / 2.0);
+    CGEventRef pointerSnapshot = CGEventCreate(NULL);
+    CGPoint originalPosition = pointerSnapshot
+        ? CGEventGetLocation(pointerSnapshot)
+        : CGPointZero;
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGEventRef down = source ? CGEventCreateMouseEvent(
         source, kCGEventLeftMouseDown, point, kCGMouseButtonLeft) : NULL;
@@ -325,6 +329,10 @@ static void press_unique_button(NSString *bundleID, NSString *title) {
         usleep(20000);
         CGEventPost(kCGHIDEventTap, up);
     }
+    if (pointerSnapshot) {
+        CGWarpMouseCursorPosition(originalPosition);
+    }
+    if (pointerSnapshot) CFRelease(pointerSnapshot);
     if (down) CFRelease(down);
     if (up) CFRelease(up);
     if (source) CFRelease(source);

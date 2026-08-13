@@ -178,6 +178,14 @@ check_sh 'T3 focus verifies the LaunchServices Hammerspoon acknowledgement' \
    PATH="$TMP_DIR/bin:/usr/bin:/bin"; HOME="$TMP_DIR/url-home";
    NAME=task; SESSION=thread-1; focus_t3code 2>&1 | grep -q "via Hammerspoon (verified)"'
 
+check_sh 'T3 Hammerspoon focus restores the original pointer position' \
+  'grep -q "local originalPosition = hs.mouse.absolutePosition()" hammerspoon_deckbridge.lua &&
+   grep -q "hs.mouse.absolutePosition(originalPosition)" hammerspoon_deckbridge.lua'
+
+check_sh 'T3 native focus fallback restores the original pointer position' \
+  'grep -q "CGEventGetLocation(pointerSnapshot)" DeckbridgeMic.m &&
+   grep -q "CGWarpMouseCursorPosition(originalPosition)" DeckbridgeMic.m'
+
 matcher() {
   FOCUS_AGENT_LIB_ONLY=1 bash -c ". \"$SCRIPT\"; ssh_pane_for_host \"\$1\" \"\$2\"" _ "$1" "$2"
 }
