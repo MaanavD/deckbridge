@@ -190,6 +190,193 @@ static NSString *string_from_ax_value(CFTypeRef value) {
     return nil;
 }
 
+static NSString *ax_string(AXUIElementRef element, CFStringRef attribute) {
+    CFTypeRef value = NULL;
+    if (AXUIElementCopyAttributeValue(element, attribute, &value) != kAXErrorSuccess || !value) {
+        return nil;
+    }
+    NSString *text = string_from_ax_value(value);
+    CFRelease(value);
+    return text;
+}
+
+static BOOL element_mentions(AXUIElementRef element, NSString *needle) {
+    const CFStringRef attributes[] = {
+        kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute,
+        kAXHelpAttribute, CFSTR("AXPlaceholderValue")
+    };
+    for (NSUInteger index = 0; index < 5; index++) {
+        NSString *text = ax_string(element, attributes[index]);
+        if (text.length && [text rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL element_equals(AXUIElementRef element, NSString *needle) {
+    const CFStringRef attributes[] = {
+        kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute,
+        kAXHelpAttribute, CFSTR("AXPlaceholderValue")
+    };
+    NSString *expected = [needle stringByTrimmingCharactersInSet:
+                          NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    for (NSUInteger index = 0; index < 5; index++) {
+        NSString *text = [ax_string(element, attributes[index])
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (text.length && [text caseInsensitiveCompare:expected] == NSOrderedSame) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void collect_matching_buttons(AXUIElementRef element, NSString *needle,
+                                     NSUInteger depth, NSUInteger *visited,
+                                     NSMutableArray *matches, BOOL exact) {
+    if (!element || depth > 40 || *visited >= 30000) return;
+    (*visited)++;
+    NSString *role = ax_string(element, kAXRoleAttribute);
+    if ([role isEqualToString:(__bridge NSString *)kAXButtonRole] &&
+            (exact ? element_equals(element, needle) : element_mentions(element, needle))) {
+        [matches addObject:(__bridge id)element];
+    }
+    CFTypeRef childrenValue = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, &childrenValue)
+            != kAXErrorSuccess || !childrenValue) return;
+    if (CFGetTypeID(childrenValue) == CFArrayGetTypeID()) {
+        CFArrayRef children = (CFArrayRef)childrenValue;
+        for (CFIndex index = 0; index < CFArrayGetCount(children); index++) {
+            CFTypeRef child = CFArrayGetValueAtIndex(children, index);
+            if (child && CFGetTypeID(child) == AXUIElementGetTypeID()) {
+                collect_matching_buttons((AXUIElementRef)child, needle,
+                                         depth + 1, visited, matches, exact);
+            }
+        }
+    }
+    CFRelease(childrenValue);
+}
+
+static AXUIElementRef app_element(NSString *bundleID) {
+    NSArray<NSRunningApplication *> *apps =
+        [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID];
+    if (apps.count != 1) {
+        fail([NSString stringWithFormat:@"expected one running app for %@; found %lu",
+              bundleID, (unsigned long)apps.count], 5);
+    }
+    AXUIElementRef app = AXUIElementCreateApplication(apps[0].processIdentifier);
+    if (!app) fail(@"could not construct application accessibility element", 5);
+    return app;
+}
+
+static void press_unique_button(NSString *bundleID, NSString *title) {
+    NSArray<NSRunningApplication *> *running =
+        [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID];
+    if (running.count == 1) {
+        [running[0] activateWithOptions:0];
+        usleep(150000);
+    }
+    AXUIElementRef app = app_element(bundleID);
+    NSUInteger visited = 0;
+    NSMutableArray *matches = [NSMutableArray array];
+    collect_matching_buttons(app, title, 0, &visited, matches, YES);
+    if (matches.count == 0) {
+        visited = 0;
+        collect_matching_buttons(app, title, 0, &visited, matches, NO);
+    }
+    if (matches.count != 1) {
+        CFRelease(app);
+        fail([NSString stringWithFormat:@"expected one button containing '%@' in %@; found %lu",
+              title, bundleID, (unsigned long)matches.count], 5);
+    }
+    AXUIElementRef button = (__bridge AXUIElementRef)matches[0];
+    CFTypeRef positionValue = NULL;
+    CFTypeRef sizeValue = NULL;
+    CGPoint position = CGPointZero;
+    CGSize size = CGSizeZero;
+    BOOL hasGeometry =
+        AXUIElementCopyAttributeValue(button, kAXPositionAttribute, &positionValue) == kAXErrorSuccess &&
+        AXUIElementCopyAttributeValue(button, kAXSizeAttribute, &sizeValue) == kAXErrorSuccess &&
+        positionValue && sizeValue &&
+        CFGetTypeID(positionValue) == AXValueGetTypeID() &&
+        CFGetTypeID(sizeValue) == AXValueGetTypeID() &&
+        AXValueGetValue((AXValueRef)positionValue, kAXValueCGPointType, &position) &&
+        AXValueGetValue((AXValueRef)sizeValue, kAXValueCGSizeType, &size) &&
+        size.width > 0 && size.height > 0;
+    if (positionValue) CFRelease(positionValue);
+    if (sizeValue) CFRelease(sizeValue);
+    if (!hasGeometry) {
+        CFRelease(app);
+        fail(@"matched button has no clickable geometry", 5);
+    }
+    // Chromium advertises AXPress on its sidebar buttons but T3 Code 0.0.33
+    // ignores that action. A real click at the centre of the uniquely matched
+    // AX element navigates reliably. The caller still verifies the resulting
+    // thread URL, so a moved/stale element cannot be reported as success.
+    CGPoint point = CGPointMake(position.x + size.width / 2.0,
+                                position.y + size.height / 2.0);
+    CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
+    CGEventRef down = source ? CGEventCreateMouseEvent(
+        source, kCGEventLeftMouseDown, point, kCGMouseButtonLeft) : NULL;
+    CGEventRef up = source ? CGEventCreateMouseEvent(
+        source, kCGEventLeftMouseUp, point, kCGMouseButtonLeft) : NULL;
+    if (down) CGEventPost(kCGHIDEventTap, down);
+    if (up) {
+        usleep(20000);
+        CGEventPost(kCGHIDEventTap, up);
+    }
+    if (down) CFRelease(down);
+    if (up) CFRelease(up);
+    if (source) CFRelease(source);
+    CFRelease(app);
+    if (!down || !up) fail(@"could not construct matched-button click", 5);
+}
+
+static BOOL focus_text_entry_in_element(AXUIElementRef element, BOOL preferred,
+                                        NSUInteger depth, NSUInteger *visited) {
+    if (!element || depth > 40 || *visited >= 30000) return NO;
+    (*visited)++;
+    NSString *role = ax_string(element, kAXRoleAttribute);
+    BOOL textRole = [role isEqualToString:(__bridge NSString *)kAXTextAreaRole] ||
+                    [role isEqualToString:(__bridge NSString *)kAXTextFieldRole];
+    if (textRole && (!preferred || element_mentions(element, @"ask") ||
+                     element_mentions(element, @"message") ||
+                     element_mentions(element, @"prompt"))) {
+        if (AXUIElementSetAttributeValue(element, kAXFocusedAttribute, kCFBooleanTrue)
+                == kAXErrorSuccess) return YES;
+    }
+    CFTypeRef childrenValue = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, &childrenValue)
+            != kAXErrorSuccess || !childrenValue) return NO;
+    BOOL focused = NO;
+    if (CFGetTypeID(childrenValue) == CFArrayGetTypeID()) {
+        CFArrayRef children = (CFArrayRef)childrenValue;
+        for (CFIndex index = 0; index < CFArrayGetCount(children); index++) {
+            CFTypeRef child = CFArrayGetValueAtIndex(children, index);
+            if (child && CFGetTypeID(child) == AXUIElementGetTypeID() &&
+                    focus_text_entry_in_element((AXUIElementRef)child, preferred,
+                                                depth + 1, visited)) {
+                focused = YES;
+                break;
+            }
+        }
+    }
+    CFRelease(childrenValue);
+    return focused;
+}
+
+static void focus_text_entry(NSString *bundleID) {
+    AXUIElementRef app = app_element(bundleID);
+    NSUInteger visited = 0;
+    BOOL focused = focus_text_entry_in_element(app, YES, 0, &visited);
+    if (!focused) {
+        visited = 0;
+        focused = focus_text_entry_in_element(app, NO, 0, &visited);
+    }
+    CFRelease(app);
+    if (!focused) fail([NSString stringWithFormat:@"no focusable text entry exposed by %@", bundleID], 5);
+}
+
 static NSString *web_url_in_element(AXUIElementRef element,
                                     NSUInteger depth,
                                     NSUInteger *visited) {
@@ -269,6 +456,56 @@ static NSString *selected_web_url(NSString *bundle_id) {
     return url;
 }
 
+// Return every currently exposed web route, one line per window.  The watcher
+// owns parsing; keeping this as a tiny tab-separated protocol lets the helper
+// retain the Accessibility boundary and avoids a fragile AppleScript scrape of
+// Electron's window hierarchy.
+static NSString *web_windows(NSString *bundle_id, BOOL require_urls) {
+    NSArray<NSRunningApplication *> *apps =
+        [NSRunningApplication runningApplicationsWithBundleIdentifier:bundle_id];
+    if (apps.count != 1) {
+        fail([NSString stringWithFormat:@"expected one running app for %@; found %lu",
+              bundle_id, (unsigned long)apps.count], 5);
+    }
+    AXUIElementRef app = AXUIElementCreateApplication(apps[0].processIdentifier);
+    if (!app) fail(@"could not construct application accessibility element", 5);
+    CFTypeRef windows_value = NULL;
+    if (AXUIElementCopyAttributeValue(app, kAXWindowsAttribute, &windows_value)
+            != kAXErrorSuccess || !windows_value ||
+            CFGetTypeID(windows_value) != CFArrayGetTypeID()) {
+        if (windows_value) CFRelease(windows_value);
+        CFRelease(app);
+        fail([NSString stringWithFormat:@"no windows exposed by %@", bundle_id], 5);
+    }
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    CFArrayRef windows = (CFArrayRef)windows_value;
+    for (CFIndex index = 0; index < CFArrayGetCount(windows); index++) {
+        CFTypeRef item = CFArrayGetValueAtIndex(windows, index);
+        if (!item || CFGetTypeID(item) != AXUIElementGetTypeID()) continue;
+        NSUInteger visited = 0;
+        NSString *url = web_url_in_element((AXUIElementRef)item, 0, &visited);
+        if (require_urls && !url.length) continue;
+        CFTypeRef title_value = NULL;
+        NSString *title = @"";
+        if (AXUIElementCopyAttributeValue((AXUIElementRef)item, kAXTitleAttribute,
+                                          &title_value) == kAXErrorSuccess && title_value) {
+            NSString *candidate = string_from_ax_value(title_value);
+            if (candidate.length) title = candidate;
+            CFRelease(title_value);
+        }
+        title = [[title stringByReplacingOccurrencesOfString:@"\t" withString:@" "]
+                 stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        [lines addObject:[NSString stringWithFormat:@"%ld\t%@\t%@",
+                          (long)index, title, url ?: @""]];
+    }
+    CFRelease(windows_value);
+    CFRelease(app);
+    if (lines.count == 0) {
+        fail([NSString stringWithFormat:require_urls ? @"no web routes exposed by %@" : @"no windows exposed by %@", bundle_id], 5);
+    }
+    return [lines componentsJoinedByString:@"\n"];
+}
+
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSMutableArray<NSString *> *arguments = [NSMutableArray array];
@@ -281,7 +518,7 @@ int main(int argc, const char *argv[]) {
         }
         NSString *command = arguments.count ? arguments[0] : @"request-access";
         if ([command isEqualToString:@"version"]) {
-            return complete(@"6", 0, NO);
+            return complete(@"9", 0, NO);
         }
         if ([command isEqualToString:@"event-shape"]) {
             if (arguments.count != 4) {
@@ -353,6 +590,36 @@ int main(int argc, const char *argv[]) {
                 fail(@"Deckbridge Mic is not trusted. Open System Settings > Privacy & Security > Accessibility and enable Deckbridge Mic.", 4);
             }
             return complete(selected_web_url(arguments[1]), 0, NO);
+        }
+        if ([command isEqualToString:@"web-urls"]) {
+            if (arguments.count != 2) {
+                fail(@"usage: deckbridge-mic web-urls <bundle-id>", 2);
+            }
+            if (!AXIsProcessTrusted()) {
+                fail(@"Deckbridge Mic is not trusted. Open System Settings > Privacy & Security > Accessibility and enable Deckbridge Mic.", 4);
+            }
+            return complete(web_windows(arguments[1], YES), 0, NO);
+        }
+        if ([command isEqualToString:@"web-windows"]) {
+            if (arguments.count != 2) {
+                fail(@"usage: deckbridge-mic web-windows <bundle-id>", 2);
+            }
+            if (!AXIsProcessTrusted()) {
+                fail(@"Deckbridge Mic is not trusted. Open System Settings > Privacy & Security > Accessibility and enable Deckbridge Mic.", 4);
+            }
+            return complete(web_windows(arguments[1], NO), 0, NO);
+        }
+        if ([command isEqualToString:@"press-button"]) {
+            if (arguments.count != 3) fail(@"usage: deckbridge-mic press-button <bundle-id> <title>", 2);
+            if (!AXIsProcessTrusted()) fail(@"Deckbridge Mic is not trusted. Enable it in Accessibility.", 4);
+            press_unique_button(arguments[1], arguments[2]);
+            return complete(@"", 0, NO);
+        }
+        if ([command isEqualToString:@"focus-text-entry"]) {
+            if (arguments.count != 2) fail(@"usage: deckbridge-mic focus-text-entry <bundle-id>", 2);
+            if (!AXIsProcessTrusted()) fail(@"Deckbridge Mic is not trusted. Enable it in Accessibility.", 4);
+            focus_text_entry(arguments[1]);
+            return complete(@"", 0, NO);
         }
         if (![command isEqualToString:@"tap"] &&
             ![command isEqualToString:@"key-down"] &&

@@ -2,7 +2,7 @@
 
 Deckbridge turns an Elgato Stream Deck into a live control surface for coding
 agents, communication apps, and push-to-talk dictation on macOS. Active Claude
-Code, Codex, Cursor, Hermes, HerdR, and cmux sessions can appear as keys; a tap
+Code, Codex, Cursor, Hermes, T3 Code, and cmux sessions can appear as keys; a tap
 returns to the exact session and a long press dismisses stale work.
 
 The project includes a browser emulator, so most of the experience can be
@@ -13,7 +13,13 @@ tested without Stream Deck hardware.
 - Shows up to ten live agent sessions with working, waiting, done, and idle
   states.
 - Treats a completed result as “needs you” until its session has been opened;
+- Discovers open native Claude, Codex, and Cursor desktop conversations through
+  the optional Deckbridge Mic Accessibility helper, then returns to the exact
+  conversation with its app deep link. Native apps do not expose reliable
+  per-tab generation status, so an open desktop conversation is shown as live.
   viewed completions settle into the quiet done state.
+- Reads T3 Code's authenticated local API for exact thread titles, lifecycle,
+  approvals, and pending user input. T3 threads use their native provider logo.
 - Focuses the exact application tab or terminal pane instead of merely raising
   an app.
 - Reflows keys after sessions end or are dismissed.
@@ -47,7 +53,7 @@ re-sorts when capacity is available again.
 - macOS
 - Python 3.9 or newer
 - Optional: an Elgato Stream Deck and the `hidapi` library
-- Optional: Claude Code, Codex, Cursor, HerdR, cmux, Discord, or the work apps
+- Optional: Claude Code, Codex, Cursor, T3 Code, cmux, Discord, or the work apps
   you want to control
 
 Only `websockets` is required for the browser emulator. Physical rendering also
@@ -70,6 +76,9 @@ cp apps.example.json ~/.deckbridge/apps.json
 # Add hooks for the locally installed agent tools.
 .venv/bin/python install_hooks.py --apply
 
+# Optional: install and authenticate T3 Code for reliable managed threads.
+./install_t3code.sh
+
 # Start with the browser emulator.
 ./deckbridge.sh start
 ```
@@ -90,6 +99,10 @@ Useful lifecycle commands:
 
 Missing optional integrations are skipped with a reason; they do not prevent
 local agent sessions and the emulator from working.
+
+T3 Code keys always target the installed desktop app. If a browser page asks
+for a pairing or bootstrap credential, close that page and use the native T3
+Code key; Deckbridge never exposes its private API credential to a browser.
 
 ### Start at login
 
@@ -118,6 +131,8 @@ Machine-specific values do not belong in the repository:
   shortcuts. Copy `apps.example.json` and replace its placeholders.
 - Discord tokens are read from `DISCORD_BOT_TOKEN` or a local Hermes `.env`.
   Never put a token in either repository file.
+- The T3 bearer session lives at `~/.deckbridge/t3code_token` with mode 600.
+  It is never copied into the repository or generated launchd runtime.
 
 For a Hermes Discord launcher, set the URL in your private `apps.json`:
 
@@ -144,7 +159,7 @@ The default routes include:
 - Codex desktop: Command-Shift-D
 - Claude Code: Space while held
 - Cursor: Control-M
-- HerdR and ordinary text fields: macOS Dictation
+- T3 Code and ordinary text fields: macOS Dictation
 
 Install the signed local helper and grant it Accessibility access when macOS
 prompts:
@@ -169,7 +184,8 @@ agent and app connectors ──► deckd.py WebSocket hub ──► Stream Deck 
 
 `deckd.py` owns the surface and routes presses to the connector that painted a
 key. `connector_agents.py` merges agent feeds, assigns stable slots, and handles
-focus/launch actions. `connector_mic.py` owns hold-to-talk. External feeds use
+focus/launch actions. `t3code_watcher.py` consumes T3's loopback API and rereads
+its runtime descriptor after every app restart. `connector_mic.py` owns hold-to-talk. External feeds use
 bounded retries and atomic last-good state so a temporary outage does not erase
 known sessions. See [PROTOCOL.md](PROTOCOL.md) for the wire protocol.
 

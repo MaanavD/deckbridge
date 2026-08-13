@@ -43,25 +43,13 @@ class TestLogoFiles(unittest.TestCase):
     def test_mic_has_a_logo(self):
         self.assertIsNotNone(logos.logo_path("mic"))
 
-    def test_logo_filenames_are_the_source_ids(self):
-        """The emulator builds `logos/<source>.<ext>` in JS with no mapping table.
-
-        If a filename ever stops matching its source id, the browser 404s and
-        silently falls back to the letter, so this is asserted rather than
-        left to a visual check.
-
-        Sources that share one mark are exempt: hermes-discord and hermes-ssh
-        both wear the Nous mark, because Discord and ssh are transports rather
-        than products, and a shared file cannot be named after both.
-        """
-        shared = set(logos.SHARED_MARK_SOURCES) | set(logos.APP_ICON)
+    def test_every_source_has_the_mapped_logo_file(self):
+        """The connector sends this mapping to the emulator; every file exists."""
         for source in list(connector_agents.SOURCE_BADGE) + ["mic"]:
-            if source in shared:
-                continue
             with self.subTest(source=source):
                 path = logos.logo_path(source)
-                stem = os.path.splitext(os.path.basename(path))[0]
-                self.assertEqual(stem, source)
+                self.assertIsNotNone(path)
+                self.assertEqual(os.path.basename(path), logos.SOURCE_LOGO[source])
 
     def test_shared_mark_sources_resolve_to_one_file(self):
         """Every source wearing the shared mark must resolve to the same file."""

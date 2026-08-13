@@ -34,6 +34,7 @@ from connection_runtime import (
     HealthReporter,
     NONINTERACTIVE_SSH_OPTIONS,
     RetryPolicy,
+    retry_delay_for_error,
 )
 
 LOG = logging.getLogger("hermes_discord_watcher")
@@ -372,7 +373,7 @@ def run_watcher(
                     raise ValueError("remote Discord configuration lacks token or channel")
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 failures += 1
-                delay = retry.delay(failures)
+                delay = retry_delay_for_error(retry, failures, exc)
                 reporter.degraded(
                     exc, transport="ssh-config", retry_in_seconds=round(delay, 3)
                 )

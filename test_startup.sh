@@ -7,13 +7,16 @@ TMP_DIR=$(mktemp -d)
 HELPER_PID=""
 ADOPT_RENDERER_PID=""
 ADOPT_EMULATOR_PID=""
+LOCK_RUNNER_PID=""
 cleanup() {
+  [ -z "$LOCK_RUNNER_PID" ] || kill "$LOCK_RUNNER_PID" 2>/dev/null || true
   [ -z "$HELPER_PID" ] || kill "$HELPER_PID" 2>/dev/null || true
   [ -z "$ADOPT_RENDERER_PID" ] || kill "$ADOPT_RENDERER_PID" 2>/dev/null || true
   [ -z "$ADOPT_EMULATOR_PID" ] || kill "$ADOPT_EMULATOR_PID" 2>/dev/null || true
   [ -z "$HELPER_PID" ] || wait "$HELPER_PID" 2>/dev/null || true
   [ -z "$ADOPT_RENDERER_PID" ] || wait "$ADOPT_RENDERER_PID" 2>/dev/null || true
   [ -z "$ADOPT_EMULATOR_PID" ] || wait "$ADOPT_EMULATOR_PID" 2>/dev/null || true
+  [ -z "$LOCK_RUNNER_PID" ] || wait "$LOCK_RUNNER_PID" 2>/dev/null || true
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -210,7 +213,27 @@ chmod +x "$TMP_DIR/bin/partial-deckbridge"
 export FAKE_DECKBRIDGE_LOG="$TMP_DIR/deckbridge.log"
 mkdir -p "$TMP_DIR/supervisor-logs"
 python3 -c 'print("x" * 512)' >"$TMP_DIR/supervisor-logs/growing.log"
+
+# A second generation must never run `restart`: that command stops children
+# owned by the first generation and was the source of a launchd restart loop.
+mkdir -p "$TMP_DIR/locked-run/launchd-supervisor.lock"
+printf '%s\n' "$$" >"$TMP_DIR/locked-run/launchd-supervisor.lock/pid"
+DECKBRIDGE_RUN_DIR="$TMP_DIR/locked-run" \
+  DECKBRIDGE_COMMAND="$TMP_DIR/bin/partial-deckbridge" \
+  DECKBRIDGE_LOG_DIR="$TMP_DIR/supervisor-logs" \
+  "$ROOT/deckbridge_launchd.sh" >"$TMP_DIR/locked-runner.log" 2>&1 &
+LOCK_RUNNER_PID=$!
+sleep 0.1
+check "a concurrent supervisor waits without restarting shared children" \
+  test ! -s "$FAKE_DECKBRIDGE_LOG"
+kill "$LOCK_RUNNER_PID" 2>/dev/null || true
+wait "$LOCK_RUNNER_PID" 2>/dev/null || true
+LOCK_RUNNER_PID=""
+rm -f "$TMP_DIR/locked-run/launchd-supervisor.lock/pid"
+rmdir "$TMP_DIR/locked-run/launchd-supervisor.lock"
+
 runner_out=$(DECKBRIDGE_COMMAND="$TMP_DIR/bin/partial-deckbridge" \
+  DECKBRIDGE_RUN_DIR="$TMP_DIR/runner-run" \
   DECKBRIDGE_HEALTH_INTERVAL=0.01 \
   DECKBRIDGE_LOG_DIR="$TMP_DIR/supervisor-logs" \
   DECKBRIDGE_LOG_MAX_BYTES=128 DECKBRIDGE_LOG_KEEP_BYTES=32 \
@@ -253,7 +276,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 0.1
 done
 read -r TEST_WS_PORT TEST_HTTP_PORT <"$TMP_DIR/ports"
-for name in deckd connector_agents connector_mic hermes_agents discord_watcher renderer_hw; do
+for name in deckd connector_agents desktop_sessions t3code_watcher connector_mic hermes_agents discord_watcher renderer_hw; do
   printf '%s\n' "$HELPER_PID" >"$TMP_DIR/run/$name.pid"
 done
 health_out=$(DECKBRIDGE_RUN_DIR="$TMP_DIR/run" WS_PORT="$TEST_WS_PORT" \
@@ -317,6 +340,27 @@ local_health_out=$(DECKBRIDGE_RUN_DIR="$TMP_DIR/run" WS_PORT="$TEST_WS_PORT" \
 local_health_rc=$?
 check "external outage does not fail local supervisor health" \
   test "$local_health_rc" -eq 0
+
+# The documented convenience command must remain an actual command, not fall
+# into the usage/default branch. T3 is part of the local connection report.
+python3 - "$TMP_DIR/health" <<'PY'
+import json, os, sys, time
+for name in ("t3code_watcher", "connector_agents", "connector_mic", "renderer_hw",
+             "hermes_agents", "discord_watcher"):
+    with open(os.path.join(sys.argv[1], name + ".json"), "w") as f:
+        json.dump({"name": name, "status": "ready",
+                   "checked_at": time.time(), "last_success_at": time.time(),
+                   "stale_after_seconds": 30, "consecutive_failures": 0,
+                   "error": ""}, f)
+PY
+connections_out=$(DECKBRIDGE_RUN_DIR="$TMP_DIR/run" \
+  DECKBRIDGE_HEALTH_DIR="$TMP_DIR/health" WS_PORT="$TEST_WS_PORT" \
+  HTTP_PORT="$TEST_HTTP_PORT" MIC_KEY=14 OPEN_BROWSER=0 \
+  "$ROOT/deckbridge.sh" connections 2>&1)
+check "connections command runs the complete health report" \
+  grep -q 'full hardware stack is healthy' <<<"$connections_out"
+check "connections command includes the T3 API feed" \
+  grep -q 't3code_watcher feed is ready' <<<"$connections_out"
 
 rm "$TMP_DIR/run/renderer_hw.pid"
 unhealthy_out=$(DECKBRIDGE_RUN_DIR="$TMP_DIR/run" WS_PORT="$TEST_WS_PORT" \

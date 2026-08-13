@@ -325,10 +325,19 @@ start() {
     exit 1
   fi
 
+  # T3 Code owns its thread lifecycle and publishes exact approval/input state.
+  # Start the feed before the connector so the first board paint can include it.
+  spawn t3code_watcher "$PY" t3code_watcher.py
+
   # 2. unified agents/launchers own 0-9; fixed app shortcuts own 10-13
   # shellcheck disable=SC2086
   spawn connector_agents "$PY" connector_agents.py --claim $AGENT_CLAIM \
     --port "$WS_PORT" --max-age-hours "$MAX_AGE_HOURS"
+
+  # Native Claude, Codex, and Cursor conversations do not trigger terminal
+  # lifecycle hooks. The Accessibility-granted helper exposes their open
+  # Electron routes without requiring per-app plugins or network access.
+  spawn desktop_sessions "$PY" desktop_sessions_watcher.py
 
   # 2b. mic key (macOS only by default)
   if [ -n "$MIC_KEY" ]; then
@@ -509,7 +518,7 @@ status() {
   port_open "$HTTP_PORT" && ok "emulator served on $HTTP_PORT"    || skip "no web server on $HTTP_PORT"
   echo ""
   echo "state files:"
-  for s in ~/.deckbridge/cmux_state.json ~/.deckbridge/hermes_agents.json ~/.deckbridge/hermes_approvals.json; do
+  for s in ~/.deckbridge/cmux_state.json ~/.deckbridge/desktop_agents.json ~/.deckbridge/t3code_agents.json ~/.deckbridge/hermes_agents.json ~/.deckbridge/hermes_approvals.json; do
     if [ -f "$s" ]; then
       local n
       n=$($PY -c "import json,sys;d=json.load(open(sys.argv[1]));print(len(d.get('agents',d.get('approvals',[]))))" "$s" 2>/dev/null || echo '?')
@@ -521,7 +530,7 @@ status() {
   echo ""
   echo "connection health:"
   local health_found=0 health_name health_out
-  for health_name in hermes_agents discord_watcher connector_agents connector_mic connector_cmux connector_hermes renderer_hw; do
+  for health_name in t3code_watcher hermes_agents discord_watcher connector_agents connector_mic connector_cmux connector_hermes renderer_hw; do
     [ -f "$HEALTH_DIR/$health_name.json" ] || continue
     health_found=1
     if health_out=$(connection_health "$health_name" 2>&1); then
@@ -562,7 +571,7 @@ health() {
   done
 
   local failed=0 name
-  local required=(deckd connector_agents)
+  local required=(deckd connector_agents desktop_sessions t3code_watcher)
   [ -n "$MIC_KEY" ] && required+=(connector_mic)
   if [ "$full" = 1 ]; then
     required+=(hermes_agents discord_watcher)
@@ -606,7 +615,7 @@ health() {
     done
   fi
   if [ "$connections" = 1 ]; then
-    local connection_names=(connector_agents)
+    local connection_names=(connector_agents t3code_watcher)
     [ -z "$MIC_KEY" ] || connection_names+=(connector_mic)
     [ "$hw" = 0 ] || connection_names+=(renderer_hw)
     for name in "${connection_names[@]}"; do
@@ -646,6 +655,7 @@ case "${1:-start}" in
   restart) shift || true; stop; sleep 0.5; start "$@" ;;
   status)  status ;;
   health)  shift || true; health "$@" ;;
+  connections) health --full --hw --connections ;;
   logs)    shift || true; logs "$@" ;;
   doctor)  doctor ;;
   *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;

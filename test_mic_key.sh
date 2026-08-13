@@ -47,6 +47,9 @@ status_for() {
 out="$(status_for 'Discord|com.hnc.Discord')"
 check contains "$out" 'classification=discord'
 
+out="$(status_for 'T3 Code (Alpha)|com.t3tools.t3code')"
+check contains "$out" 'classification=t3code'
+
 out="$(status_for 'Ghostty|com.mitchellh.ghostty' claude)"
 check contains "$out" 'classification=claude-code'
 

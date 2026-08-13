@@ -16,6 +16,8 @@ from connection_runtime import (
     ConnectionHealth,
     HealthReporter,
     RetryPolicy,
+    SSH_AUTH_RETRY_SECONDS,
+    retry_delay_for_error,
     reconnect_forever,
 )
 
@@ -35,6 +37,13 @@ def test_retry_policy() -> None:
     delays = [policy.delay(failures) for failures in range(1, 7)]
     check("retry delay grows and caps", delays == [1, 2, 4, 5, 5, 5], str(delays))
     check("success reset uses the initial delay", policy.delay(1) == 1)
+    check("Tailscale auth challenges cool down instead of flashing",
+          retry_delay_for_error(
+              policy, 1,
+              "To authenticate, visit: https://login.tailscale.com/a/example",
+          ) == SSH_AUTH_RETRY_SECONDS)
+    check("ordinary failures keep normal exponential backoff",
+          retry_delay_for_error(policy, 2, "connection reset") == 2)
 
 
 def test_health_reporter() -> None:

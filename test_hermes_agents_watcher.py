@@ -67,6 +67,11 @@ def main() -> int:
           and any(part.startswith("-oConnectTimeout=") for part in ssh_cmd)
           and "-oConnectionAttempts=1" in ssh_cmd,
           " ".join(ssh_cmd))
+    check("ssh polls reuse one durable transport instead of retriggering auth",
+          "-oControlMaster=auto" in ssh_cmd
+          and any(part.startswith("-oControlPersist=") for part in ssh_cmd)
+          and any(part.startswith("-oControlPath=") for part in ssh_cmd),
+          " ".join(ssh_cmd))
     check("ssh argv keeps extra ssh options", "-oBatchMode=yes" in ssh_cmd)
     check("repeated --source is forwarded once per value",
           [ssh_cmd[i + 1] for i, a in enumerate(ssh_cmd) if a == "--source"]

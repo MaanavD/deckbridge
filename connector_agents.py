@@ -41,6 +41,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -72,11 +73,16 @@ DEFAULT_CLAIM = (0, 13)
 DEFAULT_POLL_INTERVAL = 0.5
 DEFAULT_HERMES_STATE = "~/.deckbridge/hermes_agents.json"
 DEFAULT_LOCAL_STATE = "~/.deckbridge/cmux_state.json"
+DEFAULT_DESKTOP_STATE = "~/.deckbridge/desktop_agents.json"
+DEFAULT_T3CODE_STATE = "~/.deckbridge/t3code_agents.json"
 DEFAULT_APPROVALS_STATE = "~/.deckbridge/hermes_approvals.json"
+TAILSCALE_AUTH_URL = re.compile(
+    r"https://login\.tailscale\.com/a/[A-Za-z0-9]+"
+)
 DEFAULT_FOCUS_CMD = (
     "./focus_agent.sh --source {source} --name {name} --cwd {cwd} "
     "--url {url} --session {session_id} --tty {tty} --app {app} "
-    "--surface {surface} --herdr-pane {herdr_pane}"
+    "--surface {surface} --herdr-pane {herdr_pane} --web-url {web_url}"
 )
 
 #: Agents untouched for longer than this drop off the board entirely.
@@ -176,7 +182,7 @@ DEFAULT_LAUNCHERS = [
         "sublabel": "new session",
     },
     {
-        "label": "HerdR", "source": "herdr", "bundle": "Herdr",
+        "label": "T3 Code", "source": "t3code", "bundle": "T3 Code (Alpha)",
         "sublabel": "new session",
     },
     {
@@ -222,8 +228,17 @@ SOURCE_BADGE = {
     "hermes-ssh": "S",
     "hermes-health": "!",
     "claude-code": "C",
+    "claude-desktop": "C",
     "codex-cli": "X",
+    "codex-desktop": "X",
     "cursor-agent": "R",
+    "cursor-desktop": "R",
+    "t3code": "T",
+    "t3code-claude": "C",
+    "t3code-codex": "X",
+    "t3code-cursor": "R",
+    "t3code-grok": "G",
+    "t3code-opencode": "O",
     "herdr": "E",
     "cmux": "M",
     "slack": "L",
@@ -320,6 +335,7 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
             "source": source,
             "cwd": str(item.get("cwd") or ""),
             "url": str(item.get("url") or ""),
+            "web_url": str(item.get("web_url") or ""),
             "thread_id": str(item.get("thread_id") or ""),
             "session_id": str(item.get("session_id") or ""),
             # For a remote terminal session this is the exact SSH alias used
@@ -359,6 +375,56 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
     return agents
 
 
+def read_viewed(path: Path) -> list[dict[str, str]]:
+    """Read exact, ephemeral surface identities selected outside the deck."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    raw = data.get("viewed") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    fields = ("source", "url", "session_id", "thread_id", "surface",
+              "herdr_pane", "tty", "app", "unique_app")
+    return [
+        {field: str(item.get(field) or "") for field in fields}
+        for item in raw if isinstance(item, dict)
+    ]
+
+
+def manual_view_matches(
+    agent: dict[str, Any], view: dict[str, str], agents: list[dict[str, Any]],
+) -> bool:
+    """Require one strong selected-surface identity; never infer from a label."""
+    source = view.get("source", "")
+    if source and source != str(agent.get("source") or ""):
+        return False
+    for field in ("session_id", "thread_id", "surface", "herdr_pane", "tty"):
+        selected = view.get(field, "")
+        if selected:
+            return selected == str(agent.get(field) or "")
+    selected_url = view.get("url", "").rstrip("/")
+    agent_url = str(agent.get("url") or "").rstrip("/")
+    if selected_url and agent_url:
+        # Discord may append a selected message id after the thread/channel.
+        return selected_url == agent_url or selected_url.startswith(agent_url + "/")
+    app = view.get("app", "")
+    if app and view.get("unique_app") == "1" and app == str(agent.get("app") or ""):
+        candidates = [a for a in agents if str(a.get("app") or "") == app]
+        precise = [a for a in candidates if not str(a.get("source") or "").endswith("-desktop")]
+        if precise:
+            # A generic desktop-window record may shadow the one hook-backed
+            # session. When exactly one precise session exists, viewing the app
+            # acknowledges both representations so the fallback cannot keep a
+            # duplicate NEEDS YOU key alive.
+            return len(precise) == 1 and agent in (precise[0], *[
+                a for a in candidates
+                if str(a.get("source") or "").endswith("-desktop")
+            ])
+        return len(candidates) == 1 and agent is candidates[0]
+    return False
+
+
 def decay_stale(agents: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
     """Demote agents whose live status is contradicted by a silent heartbeat.
 
@@ -370,7 +436,12 @@ def decay_stale(agents: list[dict[str, Any]], now: float) -> list[dict[str, Any]
     for agent in agents:
         item = dict(agent)
         stamp = item.get("updated_at") or 0.0
+        # T3 is polled continuously and its lifecycle flags are authoritative;
+        # a long turn may legitimately have no event timestamp for many
+        # minutes. The stale-heartbeat rule exists for event-only hook feeds.
+        authoritative = str(item.get("source") or "").startswith("t3code")
         if (item["status"] in {"working", "blocked"} and stamp
+                and not authoritative
                 and not item.get("_verified_live")):
             if now - stamp > STALE_WORKING_S:
                 item["status"] = "done"
@@ -993,6 +1064,8 @@ class AgentConnector:
         claim: tuple[int, int] = DEFAULT_CLAIM,
         hermes_state: str | os.PathLike[str] = DEFAULT_HERMES_STATE,
         local_state: str | os.PathLike[str] = DEFAULT_LOCAL_STATE,
+        desktop_state: str | os.PathLike[str] | None = None,
+        t3code_state: str | os.PathLike[str] | None = None,
         focus_cmd: str = DEFAULT_FOCUS_CMD,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
@@ -1013,6 +1086,18 @@ class AgentConnector:
         self.claim = (first, last)
         self.hermes_state = Path(os.path.expanduser(os.fspath(hermes_state)))
         self.local_state = Path(os.path.expanduser(os.fspath(local_state)))
+        # The CLI always passes the configured desktop feed explicitly. Keeping
+        # direct library construction isolated prevents unit tests and embedded
+        # consumers with temporary local feeds from accidentally ingesting the
+        # real user's ~/.deckbridge desktop state.
+        self.desktop_state = (
+            Path(os.path.expanduser(os.fspath(desktop_state)))
+            if desktop_state is not None else Path(os.devnull)
+        )
+        self.t3code_state = (
+            Path(os.path.expanduser(os.fspath(t3code_state)))
+            if t3code_state is not None else Path(os.devnull)
+        )
         self.focus_cmd = focus_cmd
         self.poll_interval = poll_interval
         self.max_age_hours = max_age_hours
@@ -1074,8 +1159,10 @@ class AgentConnector:
             # watcher has spoken, degraded/stale/invalid must be a visible deck
             # event rather than a silently empty or deceptively cached board.
             if feed.state not in ("ready", "missing"):
-                error = str(feed.document.get("error") or feed.message).lower()
-                auth = "additional check" in error or "login.tailscale" in error
+                raw_error = str(feed.document.get("error") or feed.message)
+                error = raw_error.lower()
+                auth_url = TAILSCALE_AUTH_URL.search(raw_error)
+                auth = "additional check" in error or auth_url is not None
                 agents.append({
                     "name": "Hermes auth" if auth else "Hermes feed",
                     "status": "blocked",
@@ -1085,12 +1172,24 @@ class AgentConnector:
                     "system_notice": True,
                     "notice_label": "SIGN IN" if auth else "OFFLINE",
                     "detail": feed.message,
+                    # Only an exact vendor-owned check URL becomes actionable;
+                    # arbitrary transport errors can never turn into links.
+                    "url": auth_url.group(0) if auth_url is not None else "",
                 })
         local = read_agents(self.local_state, source_default="cmux")
         agents += reconcile_local_liveness(local, self.liveness_probe)
+        # Native desktop conversations do not have a child CLI PID to probe.
+        # Their watcher renews only while an Accessibility-visible app window
+        # still exposes the exact deep-link route.
+        agents += read_agents(self.desktop_state, source_default="desktop")
+        agents += read_agents(self.t3code_state, source_default="t3code")
         agents = decay_stale(agents, current)
         agents = drop_uninteresting(agents, current, self.max_age_hours)
         agents = dedupe_labels(agents)
+        for view in read_viewed(self.desktop_state):
+            for agent in agents:
+                if manual_view_matches(agent, view, agents):
+                    self.mark_seen(agent)
         # Acknowledgements are forgotten for agents that have left the feeds
         # entirely, or the dicts grow without bound in a long-running session.
         # This is done BEFORE the dismissed filter, because a dismissed agent is
@@ -1223,6 +1322,17 @@ class AgentConnector:
         be taken to a running session, and opening a blank window in that case
         would answer a question nobody asked.
         """
+        if (self.launch_cmd == DEFAULT_LAUNCH_CMD
+                and app.get("source") == "t3code"):
+            command = "./focus_agent.sh --launch-t3code"
+            try:
+                subprocess.run(
+                    command, shell=True, check=False, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, timeout=15,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                log.warning("T3 Code new-thread launch failed: %s", exc)
+            return
         url = str(app.get("url") or "").strip()
         profile = str(app.get("profile") or "").strip()
         profile_name = str(app.get("profile_name") or "").strip()
@@ -1328,6 +1438,7 @@ end run
                 name=shlex.quote(agent.get("name", "")),
                 cwd=shlex.quote(agent.get("cwd", "")),
                 url=shlex.quote(agent.get("url", "")),
+                web_url=shlex.quote(agent.get("web_url", "")),
                 source=shlex.quote(agent.get("source", "")),
                 thread_id=shlex.quote(agent.get("thread_id", "")),
                 session_id=shlex.quote(agent.get("session_id", "")),
@@ -1422,6 +1533,8 @@ end run
         if agent is not None:
             if agent.get("system_notice"):
                 self.mark_seen(agent)
+                if agent.get("url"):
+                    self._start_action(self.launch, agent)
                 await self.publish(force=True)
                 return
             if held >= LONG_PRESS_S:
@@ -1503,6 +1616,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hermes-state", default=DEFAULT_HERMES_STATE)
     parser.add_argument("--local-state", default=DEFAULT_LOCAL_STATE)
+    parser.add_argument("--desktop-state", default=DEFAULT_DESKTOP_STATE)
+    parser.add_argument("--t3code-state", default=DEFAULT_T3CODE_STATE)
     parser.add_argument("--focus-cmd", default=DEFAULT_FOCUS_CMD)
     parser.add_argument("--apps-config", default=DEFAULT_APPS_CONFIG)
     parser.add_argument("--launch-cmd", default=DEFAULT_LAUNCH_CMD)
@@ -1526,6 +1641,8 @@ def main(argv: list[str] | None = None) -> int:
         claim=(args.claim[0], args.claim[1]),
         hermes_state=args.hermes_state,
         local_state=args.local_state,
+        desktop_state=args.desktop_state,
+        t3code_state=args.t3code_state,
         focus_cmd=args.focus_cmd,
         poll_interval=args.poll_interval,
         max_age_hours=args.max_age_hours,

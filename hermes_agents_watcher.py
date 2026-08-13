@@ -27,6 +27,7 @@ from connection_runtime import (
     HealthReporter,
     NONINTERACTIVE_SSH_OPTIONS,
     RetryPolicy,
+    retry_delay_for_error,
 )
 
 LOG = logging.getLogger("hermes_agents_watcher")
@@ -244,7 +245,7 @@ def run_watcher(
             delay = max(0.05, float(args.interval))
         else:
             failures += 1
-            delay = retry.delay(failures)
+            delay = retry_delay_for_error(retry, failures, reporter.last_error)
             LOG.debug("Hermes agent retry %d in %.1fs", failures, delay)
         if args.once:
             return

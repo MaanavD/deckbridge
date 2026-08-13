@@ -42,7 +42,7 @@ SCRIPT_NAME=${0##*/}
 # Bumped whenever focus resolution changes, so --diagnose and a failed press
 # both say which checkout actually ran. A stale extract alongside a fresh one
 # produces symptoms identical to a logic bug.
-BUILD_STAMP=2026-08-10.remote-herdr-pane
+BUILD_STAMP=2026-08-13.t3code-native-only
 DRY_RUN=0
 DIAGNOSE=0
 TTY_HINT=
@@ -54,17 +54,20 @@ SURFACE_HINT=
 HERDR_PANE_HINT=
 APP_HINT=
 LAUNCH_APP=
+LAUNCH_T3CODE=0
 HELP=0
 SOURCE=
 NAME=
 CWD=
 URL=
+WEB_URL=
 SESSION=
 
 usage() {
   cat <<'EOF'
-Usage: focus_agent.sh --source SOURCE --name NAME [--cwd CWD] [--url URL] [--session SESSION_ID] [--tty TTY] [--app APP] [--surface ID] [--herdr-pane ID] [--dry-run] [--diagnose]
+Usage: focus_agent.sh --source SOURCE --name NAME [--cwd CWD] [--url URL] [--web-url URL] [--session SESSION_ID] [--tty TTY] [--app APP] [--surface ID] [--herdr-pane ID] [--dry-run] [--diagnose]
        focus_agent.sh --launch APP
+       focus_agent.sh --launch-t3code
 
 SOURCE: claude-code | codex-cli | cursor-agent | cmux | hermes-discord | hermes-ssh
 
@@ -111,6 +114,11 @@ parse_args() {
         URL=$2
         shift 2
         ;;
+      --web-url)
+        [ "$#" -ge 2 ] || { error "--web-url requires a value"; return 2; }
+        WEB_URL=$2
+        shift 2
+        ;;
       --session)
         [ "$#" -ge 2 ] || { error "--session requires a value"; return 2; }
         SESSION=$2
@@ -141,6 +149,10 @@ parse_args() {
         LAUNCH_APP=$2
         shift 2
         ;;
+      --launch-t3code)
+        LAUNCH_T3CODE=1
+        shift
+        ;;
       --diagnose)
         DIAGNOSE=1
         shift
@@ -165,12 +177,12 @@ parse_args() {
   [ "$HELP" -eq 1 ] && return 0
   # --launch is a mode of its own: an explicit "open this app" with no agent,
   # no session and no surface, so none of the agent arguments apply to it.
-  if [ -n "$LAUNCH_APP" ]; then
+  if [ -n "$LAUNCH_APP" ] || [ "$LAUNCH_T3CODE" -eq 1 ]; then
     return 0
   fi
   [ -n "$SOURCE" ] || { error "--source is required"; return 2; }
   case "$SOURCE" in
-    claude-code|codex-cli|cursor-agent|cmux|hermes-discord|hermes-ssh) ;;
+    claude-code|claude-desktop|codex-cli|codex-desktop|cursor-agent|cursor-desktop|cmux|hermes-discord|hermes-ssh|t3code|t3code-*) ;;
     *)
       error "unknown --source: $SOURCE (expected claude-code, codex-cli, cursor-agent, cmux, hermes-discord, or hermes-ssh)"
       return 2
@@ -193,6 +205,7 @@ parse_args() {
     Claude|claude) APP_HINT=Claude ;;
     ChatGPT|chatgpt|Codex|codex) APP_HINT=ChatGPT ;;
     Cursor|cursor) APP_HINT=Cursor ;;
+    "T3 Code"|"T3 Code (Alpha)"|t3code) APP_HINT="T3 Code (Alpha)" ;;
   esac
   return 0
 }
@@ -1666,8 +1679,57 @@ app_bundle_id() {
   case "$1" in
     Claude) printf 'com.anthropic.claudefordesktop\n' ;;
     ChatGPT) printf 'com.openai.codex\n' ;;
+    "T3 Code (Alpha)") printf 'com.t3tools.t3code\n' ;;
     *) return 1 ;;
   esac
+}
+
+deckbridge_control() {
+  local helper_cli
+  helper_cli=${DECKBRIDGE_CONTROL_CLI:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/mic_key.sh}
+  [ -x "$helper_cli" ] || return 1
+  "$helper_cli" "$@"
+}
+
+focus_t3code() {
+  local selected polls
+  command -v open >/dev/null 2>&1 || return 1
+  open -a "T3 Code (Alpha)" >/dev/null 2>&1 || return 1
+  if deckbridge_control --helper-press-button com.t3tools.t3code "$NAME" >/dev/null 2>&1; then
+    polls=0
+    while [ "$polls" -lt 20 ]; do
+      selected=$(deckbridge_control --helper-web-url com.t3tools.t3code 2>/dev/null || true)
+      case "$selected" in
+        *"/$SESSION"|*"/$SESSION/"*)
+          printf 'focus_agent: focused exact T3 Code thread %s (verified)\n' "$SESSION"
+          return 0
+          ;;
+      esac
+      polls=$((polls + 1))
+      sleep 0.05
+    done
+  fi
+  # The local HTTP route is not a safe fallback. Its browser client requires a
+  # separate bootstrap pairing credential and cannot inherit the desktop-managed
+  # session. Fail closed here instead of stranding the operator on a token prompt.
+  error "could not select exact T3 Code thread $SESSION"
+  return 1
+}
+
+launch_t3code_thread() {
+  command -v open >/dev/null 2>&1 || return 1
+  open -a "T3 Code (Alpha)" >/dev/null 2>&1 || return 1
+  # The app may still be constructing its renderer after a cold launch.
+  local polls=0
+  while [ "$polls" -lt 30 ]; do
+    if deckbridge_control --helper-press-button com.t3tools.t3code "New thread" >/dev/null 2>&1; then
+      return 0
+    fi
+    polls=$((polls + 1))
+    sleep 0.1
+  done
+  error "T3 Code opened but its New thread control was unavailable"
+  return 1
 }
 
 app_selected_url() {
@@ -2136,6 +2198,10 @@ main() {
     launch_app "$LAUNCH_APP"
     return $?
   fi
+  if [ "$LAUNCH_T3CODE" -eq 1 ]; then
+    launch_t3code_thread
+    return $?
+  fi
   if [ "${DIAGNOSE:-0}" -eq 1 ]; then
     diagnose
     return $?
@@ -2149,6 +2215,9 @@ main() {
     open_discord_url "$URL"
     return $?
   fi
+  case "$SOURCE" in
+    t3code|t3code-*) focus_t3code; return $? ;;
+  esac
   if [ -n "$HERDR_PANE_HINT" ]; then
     # An exact pane supplied by the connector is stronger than the legacy
     # Hermes host scan. The latter understands tmux/cmux but not a raw SSH

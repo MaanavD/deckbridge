@@ -7,7 +7,7 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SOURCE="$ROOT/DeckbridgeMic.m"
 INFO_PLIST="$ROOT/DeckbridgeMic-Info.plist"
 APP_PATH="${DECKBRIDGE_MIC_APP:-$HOME/Applications/Deckbridge Mic.app}"
-EXPECTED_VERSION=6
+EXPECTED_VERSION=9
 
 helper_path() {
     printf '%s/Contents/MacOS/deckbridge-mic\n' "$APP_PATH"
@@ -110,7 +110,12 @@ install_helper() {
     mv "$stage" "$APP_PATH" || return 1
     trap - EXIT HUP INT TERM
     printf 'installed Deckbridge Mic: %s\n' "$APP_PATH"
-    print_grant_steps
+    if DECKBRIDGE_MIC_APP="$APP_PATH" "$ROOT/mic_key.sh" --helper-check \
+            >/dev/null 2>&1; then
+        printf 'Accessibility is already ready.\n'
+    else
+        print_grant_steps
+    fi
     return 0
 }
 

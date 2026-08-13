@@ -21,13 +21,33 @@ from typing import Any, Awaitable, Callable
 
 
 DEFAULT_HEALTH_DIR = "~/.deckbridge/health"
+SSH_AUTH_RETRY_SECONDS = 300.0
 NONINTERACTIVE_SSH_OPTIONS = (
     "-oBatchMode=yes",
     "-oConnectTimeout=6",
     "-oConnectionAttempts=1",
     "-oServerAliveInterval=5",
     "-oServerAliveCountMax=1",
+    # Both Hermes adapters share this master connection. Besides cutting poll
+    # latency, it prevents each short read-only command from independently
+    # triggering Tailscale SSH check-mode reauthentication.
+    "-oControlMaster=auto",
+    "-oControlPersist=600",
+    "-oControlPath=~/.ssh/deckbridge-%C",
 )
+
+
+def retry_delay_for_error(
+    policy: "RetryPolicy", failures: int, error: object,
+) -> float:
+    """Back off human-only Tailscale checks while keeping normal retries fast."""
+    message = " ".join(str(error).split()).casefold()
+    normal = policy.delay(failures)
+    if "login.tailscale.com/a/" in message or (
+        "tailscale ssh" in message and "additional check" in message
+    ):
+        return max(normal, SSH_AUTH_RETRY_SECONDS)
+    return normal
 
 
 @dataclass(frozen=True)
@@ -89,6 +109,7 @@ class HealthReporter:
         self._last_success_at: float | None = None
         self._checked_at: float | None = None
         self._failures = 0
+        self.last_error = ""
         self._restore()
 
     def _restore(self) -> None:
@@ -143,6 +164,7 @@ class HealthReporter:
         self._last_success_at = float(self.clock())
         self._checked_at = self._last_success_at
         self._failures = 0
+        self.last_error = ""
         self._write(self._document("ready", "", details))
 
     def heartbeat(self, interval: float = 5.0, **details: Any) -> bool:
@@ -157,6 +179,7 @@ class HealthReporter:
         self._failures += 1
         self._checked_at = float(self.clock())
         message = " ".join(str(error).split()) or "connection failed"
+        self.last_error = message
         self._write(self._document("degraded", message, details))
 
 

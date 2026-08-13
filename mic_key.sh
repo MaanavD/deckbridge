@@ -93,6 +93,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 MIC_HELPER_APP="${DECKBRIDGE_MIC_APP:-$HOME/Applications/Deckbridge Mic.app}"
 MIC_HELPER="${DECKBRIDGE_MIC_HELPER:-$MIC_HELPER_APP/Contents/MacOS/deckbridge-mic}"
 MIC_HELPER_INSTALLER="${DECKBRIDGE_MIC_INSTALLER:-$SCRIPT_DIR/install_mic_helper.sh}"
+MIC_OPEN_WAS_SET="${DECKBRIDGE_MIC_OPEN+x}"
 MIC_OPEN="${DECKBRIDGE_MIC_OPEN:-/usr/bin/open}"
 MIC_GESTURE_STATE="${DECKBRIDGE_MIC_GESTURE_STATE:-$HOME/.deckbridge/mic_gesture}"
 
@@ -100,15 +101,15 @@ trim() {
     printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
-# Invoke the helper through LaunchServices in production. macOS Accessibility
-# evaluates a responsible-process chain, so executing the bundle binary as a
-# launchd subprocess can be denied even when an interactive Terminal parent
-# happens to be trusted. LaunchServices makes Deckbridge Mic.app the stable,
-# user-grantable identity. Each concurrent call owns a private atomic result
-# file because `open` cannot propagate a short-lived app's exit status.
+# Invoke the signed app binary directly in production. This is verified from
+# the target user's launchd context and preserves the helper's Accessibility
+# grant. LaunchServices `open -n` caused macOS to evaluate a fresh application
+# instance and falsely report setup-required even while the same signed binary
+# returned ready=yes. The older result-file route remains as an explicit
+# DECKBRIDGE_MIC_OPEN compatibility/test seam.
 run_helper() {
     local result_dir result_file ticks max_ticks helper_rc helper_detail
-    if [ -n "${DECKBRIDGE_MIC_HELPER:-}" ]; then
+    if [ -n "${DECKBRIDGE_MIC_HELPER:-}" ] || [ -z "$MIC_OPEN_WAS_SET" ]; then
         "$MIC_HELPER" "$@"
         return $?
     fi
@@ -373,6 +374,10 @@ classify_target() {
         *discord*|*com.hnc.discord*) TARGET="discord"; return 0 ;;
     esac
 
+    case "$app_lc|$bundle_lc" in
+        *"t3 code"*|*"|"*com.t3tools.t3code*) TARGET="t3code"; return 0 ;;
+    esac
+
     case "$app_lc" in
         *"claude code"*) TARGET="claude-code"; return 0 ;;
     esac
@@ -457,6 +462,7 @@ action_for_target() {
             ;;
         claude-desktop) printf '%s\n' "$ACTION_CLAUDE_DESKTOP" ;;
         cursor) printf '%s\n' "$ACTION_CURSOR" ;;
+        t3code) printf '%s\n' "dictation" ;;
         terminal-unknown) printf '%s\n' "$ACTION_TERMINAL_UNKNOWN" ;;
         *) printf '%s\n' "$ACTION_OTHER" ;;
     esac
@@ -720,14 +726,18 @@ print_detection() {
 }
 
 usage() {
-    printf '%s\n' "Usage: $0 [--press|--release|--dry-run|--status|--check|--helper-check|--helper-web-url BUNDLE|--request-access|--install-helper]"
+    printf '%s\n' "Usage: $0 [--press|--release|--dry-run|--status|--check|--helper-check|--helper-frontmost|--helper-focused-tty|--helper-web-url BUNDLE|--helper-web-urls BUNDLE|--helper-web-windows BUNDLE|--helper-press-button BUNDLE TITLE|--helper-focus-text-entry BUNDLE|--request-access|--install-helper]"
     printf '%s\n' "  --press    start the selected focused-app voice gesture"
     printf '%s\n' "  --release  stop the active hold-to-talk voice gesture"
     printf '%s\n' "  --dry-run  print detection and the action without executing it"
     printf '%s\n' "  --status   print detection only"
     printf '%s\n' "  --check    read-only Dictation/Accessibility setup check"
     printf '%s\n' "  --helper-check  read-only native helper Accessibility check"
+    printf '%s\n' "  --helper-frontmost  print the frontmost app identity"
+    printf '%s\n' "  --helper-focused-tty  print the selected terminal TTY when exact"
     printf '%s\n' "  --helper-web-url  read the selected AX web route for a bundle id"
+    printf '%s\n' "  --helper-web-urls  read every exposed AX web route for a bundle id"
+    printf '%s\n' "  --helper-web-windows  read every AX window title and route, if exposed"
     printf '%s\n' "  --request-access  ask macOS to show Deckbridge Mic consent"
     printf '%s\n' "  --install-helper  install stable native Deckbridge Mic.app"
 }
@@ -744,9 +754,38 @@ case "${1:-}" in
         run_helper check
         exit $?
         ;;
+    --helper-frontmost)
+        run_helper frontmost
+        exit $?
+        ;;
+    --helper-focused-tty)
+        detect_frontmost
+        focused_terminal_tty
+        exit $?
+        ;;
     --helper-web-url)
         [ "$#" -eq 2 ] || { usage >&2; exit 2; }
         run_helper web-url "$2"
+        exit $?
+        ;;
+    --helper-web-urls)
+        [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+        run_helper web-urls "$2"
+        exit $?
+        ;;
+    --helper-web-windows)
+        [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+        run_helper web-windows "$2"
+        exit $?
+        ;;
+    --helper-press-button)
+        [ "$#" -eq 3 ] || { usage >&2; exit 2; }
+        run_helper press-button "$2" "$3"
+        exit $?
+        ;;
+    --helper-focus-text-entry)
+        [ "$#" -eq 2 ] || { usage >&2; exit 2; }
+        run_helper focus-text-entry "$2"
         exit $?
         ;;
     --request-access)
@@ -795,6 +834,12 @@ case "${1:-}" in
         exit 0
         ;;
     --press|'')
+        # T3 has no native voice action. Put the insertion point in its prompt
+        # before invoking macOS Dictation so press/hold/release works even when
+        # the user last clicked the sidebar or transcript.
+        if [ "$TARGET" = "t3code" ]; then
+            run_helper focus-text-entry com.t3tools.t3code || exit $?
+        fi
         execute_action "$(action_for_target)" press
         exit $?
         ;;

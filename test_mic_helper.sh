@@ -22,7 +22,7 @@ if ! DECKBRIDGE_MIC_APP="$APP" "$ROOT/install_mic_helper.sh" install >/dev/null;
 fi
 HELPER="$APP/Contents/MacOS/deckbridge-mic"
 check test -x "$HELPER"
-check test "$("$HELPER" version)" = 6
+check test "$("$HELPER" version)" = 9
 check test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = com.deckbridge.mic-helper
 check /usr/bin/codesign --verify --deep --strict "$APP"
 

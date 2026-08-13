@@ -85,7 +85,10 @@ def test_badges_identify_the_tool() -> None:
     check("claude badge", SOURCE_BADGE["claude-code"] == "C")
     check("codex badge", SOURCE_BADGE["codex-cli"] == "X")
     check("cursor badge is distinct", SOURCE_BADGE["cursor-agent"] == "R")
-    check("badges are unique", len(set(SOURCE_BADGE.values())) == len(SOURCE_BADGE))
+    base_sources = ("hermes-discord", "hermes-ssh", "hermes-health",
+                    "claude-code", "codex-cli", "cursor-agent", "herdr", "cmux")
+    check("primary source badges are unique",
+          len({SOURCE_BADGE[s] for s in base_sources}) == len(base_sources))
     face = face_for({"name": "proj", "status": "working", "source": "codex-cli"})
     check("face carries the source badge", face["badge"] == "X")
     check("working agents shimmer", face["effect"] == "shimmer")
@@ -270,11 +273,15 @@ def test_stale_working_decays() -> None:
         {"name": "zombie", "status": "working", "updated_at": now - STALE_WORKING_S - 60,
          "source": "cmux"},
         {"name": "nostamp", "status": "working", "updated_at": 0.0, "source": "cmux"},
+        {"name": "long-t3", "status": "working",
+         "updated_at": now - STALE_WORKING_S - 600, "source": "t3code-claude"},
     ]
     out = {a["name"]: a["status"] for a in decay_stale(agents, now)}
     check("a fresh working agent stays working", out["live"] == "working")
     check("a working agent with a dead heartbeat decays", out["zombie"] == "done")
     check("an agent with no timestamp is left alone", out["nostamp"] == "working")
+    check("authoritative T3 work does not decay on a long turn",
+          out["long-t3"] == "working")
 
 
 def test_exact_liveness_drops_dead_and_preserves_live_sessions() -> None:
@@ -419,7 +426,6 @@ def test_merges_both_feeds() -> None:
         by_source = {a["source"] for a in agents}
         check("all three sources present",
               by_source == {"hermes-discord", "claude-code", "codex-cli"}, str(by_source))
-
         faces = c.build_faces(agents)
         check("the claim covers ten keys", len(faces) == 10)
         agent_faces = {i: faces[i] for i in c._agent_keys}
@@ -431,6 +437,28 @@ def test_merges_both_feeds() -> None:
         check("presses are mapped for every lit key",
               set(c._agent_keys) == set(agent_faces))
 
+
+def test_merges_native_desktop_surfaces() -> None:
+    """Desktop watcher records are live without pretending they have a CLI PID."""
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "local.json"
+        desktop = Path(tmp) / "desktop.json"
+        write(local, [])
+        write(desktop, [{
+            "name": "Plan launch", "status": "working",
+            "source": "claude-desktop", "session_id": "chat-1",
+            "app": "Claude", "updated_at": time.time(),
+            "desktop_surface": True,
+        }])
+        c = AgentConnector(local_state=local, desktop_state=desktop,
+                           hermes_state=Path(tmp) / "remote.json")
+        found = c.collect()
+        check("native Claude desktop surface reaches the agent board",
+              len(found) == 1 and found[0]["source"] == "claude-desktop", str(found))
+        c.focus_cmd = f"printf '%s|%s\\n' {{app}} {{session_id}} > {Path(tmp) / 'focus'}"
+        c.focus(found[0])
+        check("native desktop surface keeps its exact focus identity",
+              (Path(tmp) / "focus").read_text(encoding="utf-8").strip() == "Claude|chat-1")
 
 async def _noop_send(message: dict[str, Any]) -> None:
     """Swallow publishes in tests that only care about side effects."""
@@ -651,6 +679,49 @@ def test_done_needs_attention_until_viewed() -> None:
           and viewed["icon"] == "check-outline", str(viewed))
     check("a viewed completion returns to done priority",
           slot_priority(agent, seen=True) == STATUS_ORDER["done"])
+
+
+def test_manual_surface_view_acknowledges_the_current_event() -> None:
+    """Selecting an app tab is as real a read as pressing its deck key."""
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        hermes = root / "hermes.json"
+        desktop = root / "desktop.json"
+        write(hermes, [{
+            "name": "review draft", "status": "done",
+            "source": "hermes-discord", "thread_id": "thread-7",
+            "url": "https://discord.com/channels/guild/thread-7",
+            "updated_at": now,
+        }])
+        desktop.write_text(json.dumps({
+            "agents": [],
+            "viewed": [{
+                "source": "hermes-discord",
+                "url": "https://discord.com/channels/guild/thread-7/message-9",
+            }],
+        }), encoding="utf-8")
+        c = AgentConnector(
+            hermes_state=hermes, local_state=root / "none.json",
+            desktop_state=desktop,
+        )
+        face = c.build_faces(c.collect(now))[0]
+        check("a manually selected Discord thread becomes viewed",
+              face["seen"] is True and face["sublabel"] == "done", str(face))
+
+        # The acknowledgement covers this completion only. A later result in
+        # the same selected thread must become visible if the user has left it.
+        desktop.write_text(json.dumps({"agents": [], "viewed": []}), encoding="utf-8")
+        write(hermes, [{
+            "name": "review draft", "status": "done",
+            "source": "hermes-discord", "thread_id": "thread-7",
+            "url": "https://discord.com/channels/guild/thread-7",
+            "updated_at": now + 1,
+        }])
+        next_face = c.build_faces(c.collect(now + 1))[0]
+        check("a later completion in that thread still needs attention",
+              next_face["seen"] is False
+              and next_face["sublabel"] == "NEEDS YOU", str(next_face))
 
 
 def test_seen_expires_when_the_agent_moves_on() -> None:
@@ -938,9 +1009,9 @@ def test_missing_and_corrupt_files() -> None:
               repr([faces[i]["icon"] for i in lit]))
         check("a launcher still carries its logo source",
               [faces[i]["source"] for i in lit]
-              == ["hermes-discord", "herdr", "claude-code", "codex-cli"])
-        check("the second launcher opens standalone HerdR",
-              c._launcher_keys[7].get("bundle") == "Herdr")
+              == ["hermes-discord", "t3code", "claude-code", "codex-cli"])
+        check("the second launcher opens standalone T3 Code",
+              c._launcher_keys[7].get("bundle") == "T3 Code (Alpha)")
 
 
 def test_focus_command_receives_agent_fields() -> None:
@@ -1259,7 +1330,10 @@ def test_remote_feed_failure_is_visible_on_the_deck() -> None:
         check("a fresh Hermes feed adds no system notice",
               all(not a.get("system_notice") for a in c.collect()))
 
-        reporter.degraded("Tailscale SSH requires an additional check")
+        auth_url = "https://login.tailscale.com/a/testauth"
+        reporter.degraded(
+            f"Tailscale SSH requires an additional check. To authenticate, visit: {auth_url}"
+        )
         agents = c.collect()
         notices = [a for a in agents if a.get("system_notice")]
         check("a degraded Hermes feed creates one visible system notice",
@@ -1269,12 +1343,31 @@ def test_remote_feed_failure_is_visible_on_the_deck() -> None:
               notices[0]["name"] == "Hermes auth"
               and any(a.get("thread_id") == "thread-1" for a in agents),
               repr(agents))
+        check("the auth notice retains the exact sign-in URL",
+              notices[0].get("url") == auth_url, repr(notices[0]))
         faces = c.build_faces(agents)
         notice_key = next(index for index, agent in c._agent_keys.items()
                           if agent.get("system_notice"))
         check("the deck notice is animated and actionable-looking",
               faces[notice_key]["effect"] == "breathe"
               and faces[notice_key]["sublabel"] == "SIGN IN")
+
+        actions = []
+        c._start_action = lambda function, argument: actions.append(  # type: ignore[method-assign]
+            (function.__name__, argument)
+        )
+
+        async def quiet_publish(force: bool = False) -> None:
+            del force
+
+        c.publish = quiet_publish  # type: ignore[method-assign]
+        c._down[notice_key] = time.monotonic()
+        asyncio.run(c._handle({"type": "release", "index": notice_key}))
+        check("pressing SIGN IN opens the retained auth URL",
+              len(actions) == 1
+              and actions[0][0] == "launch"
+              and actions[0][1].get("url") == auth_url,
+              repr(actions))
 
 
 def test_slow_focus_does_not_block_the_next_button_event() -> None:
@@ -1330,6 +1423,7 @@ def main() -> int:
     test_remote_hermes_never_depends_on_local_liveness()
     test_idle_and_old_are_dropped()
     test_merges_both_feeds()
+    test_merges_native_desktop_surfaces()
     test_pager_replaces_the_dead_overflow_key()
     test_every_agent_is_reachable_by_paging()
     test_paging_wraps_and_keeps_slots_still()
@@ -1337,6 +1431,7 @@ def main() -> int:
     test_a_real_press_on_the_pager_turns_the_page()
     test_seen_marks_a_key_without_changing_its_status()
     test_done_needs_attention_until_viewed()
+    test_manual_surface_view_acknowledges_the_current_event()
     test_seen_expires_when_the_agent_moves_on()
     test_long_press_dismisses_and_short_press_focuses()
     test_long_press_reflows_survivors_before_launchers_return()

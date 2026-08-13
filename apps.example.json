@@ -6,7 +6,7 @@
       "bundle": "Discord",
       "url": "discord://-/channels/YOUR_GUILD_ID/YOUR_CHANNEL_ID"
     },
-    {"label": "HerdR", "source": "herdr", "bundle": "Herdr"},
+    {"label": "T3 Code", "source": "t3code", "bundle": "T3 Code (Alpha)"},
     {"label": "Claude", "source": "claude-code", "bundle": "Claude"},
     {"label": "GPT", "source": "codex-cli", "bundle": "ChatGPT"}
   ],

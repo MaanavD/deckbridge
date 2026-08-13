@@ -9,6 +9,9 @@ LOG_DIR=${DECKBRIDGE_LOG_DIR:-logs}
 LOG_MAX_BYTES=${DECKBRIDGE_LOG_MAX_BYTES:-5242880}
 LOG_KEEP_BYTES=${DECKBRIDGE_LOG_KEEP_BYTES:-1048576}
 STOPPING=0
+RUN_DIR=${DECKBRIDGE_RUN_DIR:-.run}
+SUPERVISOR_LOCK="$RUN_DIR/launchd-supervisor.lock"
+LOCK_OWNED=0
 
 case "$LOG_MAX_BYTES:$LOG_KEEP_BYTES" in
   *[!0-9:]*)
@@ -38,10 +41,46 @@ trim_logs() {
   done
 }
 
+release_supervisor_lock() {
+  [ "$LOCK_OWNED" = 1 ] || return 0
+  # Only the process that wrote this PID may release the lock. This protects a
+  # newer generation if shutdown and launchd restart cross in flight.
+  if [ "$(cat "$SUPERVISOR_LOCK/pid" 2>/dev/null || true)" = "$$" ]; then
+    rm -f "$SUPERVISOR_LOCK/pid"
+    rmdir "$SUPERVISOR_LOCK" 2>/dev/null || true
+  fi
+  LOCK_OWNED=0
+}
+
+acquire_supervisor_lock() {
+  local owner announced=0
+  mkdir -p "$RUN_DIR"
+  while ! mkdir "$SUPERVISOR_LOCK" 2>/dev/null; do
+    owner=$(cat "$SUPERVISOR_LOCK/pid" 2>/dev/null || true)
+    if [[ "$owner" =~ ^[0-9]+$ ]] && kill -0 "$owner" 2>/dev/null; then
+      if [ "$announced" = 0 ]; then
+        printf '[launchd] waiting for supervisor %s to finish\n' "$owner"
+        announced=1
+      fi
+      sleep 0.2
+      continue
+    fi
+    # A crash can leave the tiny directory behind. Remove only its known file
+    # and empty directory, then contend atomically again.
+    rm -f "$SUPERVISOR_LOCK/pid"
+    rmdir "$SUPERVISOR_LOCK" 2>/dev/null || true
+  done
+  printf '%s\n' "$$" >"$SUPERVISOR_LOCK/pid"
+  LOCK_OWNED=1
+}
+
 cleanup() {
   local rc=$?
   trap - EXIT INT TERM HUP
-  "$DECKBRIDGE" stop || true
+  if [ "$LOCK_OWNED" = 1 ]; then
+    "$DECKBRIDGE" stop || true
+  fi
+  release_supervisor_lock
   exit "$rc"
 }
 
@@ -54,6 +93,7 @@ trap cleanup EXIT
 trap terminate INT TERM HUP
 
 cd "$ROOT"
+acquire_supervisor_lock
 trim_logs
 printf '[launchd] starting full hardware stack from %s\n' "$ROOT"
 "$DECKBRIDGE" restart --hw || exit 1

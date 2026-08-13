@@ -29,6 +29,24 @@ else
   fail 'valid arguments are accepted'
 fi
 
+if "$SCRIPT" --source t3code-claude --name task --session thread-1 \
+    --app 'T3 Code (Alpha)' --web-url http://127.0.0.1:3773/env/thread-1 \
+    --dry-run >/dev/null 2>&1; then
+  pass 'T3 Code provider sessions are accepted'
+else
+  fail 'T3 Code provider sessions are accepted'
+fi
+
+check_t3_app() {
+  FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT"
+  [ "$(app_bundle_id 'T3 Code (Alpha)')" = com.t3tools.t3code ]
+}
+if check_t3_app; then
+  pass 'T3 Code maps to its installed bundle identifier'
+else
+  fail 'T3 Code maps to its installed bundle identifier'
+fi
+
 check_canonical_app() {
   FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT"
   parse_args --source claude-code --name cc --app claude
@@ -113,6 +131,19 @@ check_sh 'hermes-ssh never defaults cwd to the local directory' \
 
 check_sh 'hermes-ssh reports the configured ssh host' \
   'HERMES_SSH_HOST=myhermes "$SCRIPT" --source hermes-ssh --name x --dry-run | grep -q myhermes'
+
+# The local T3 HTTP route requires a separate browser bootstrap credential.
+# Falling back to it from a native-app key strands the user on a pairing-token
+# screen, so exact native focus must fail closed instead of opening a browser.
+check_sh 'T3 focus never opens its pairing-required browser route' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   printf "#!/bin/sh\nprintf \"%%s\\n\" \"\$*\" >> \"$TMP_DIR/t3-opened\"\nexit 0\n" > "$TMP_DIR/bin/open";
+   printf "#!/bin/sh\nexit 1\n" > "$TMP_DIR/t3-control";
+   chmod +x "$TMP_DIR/bin/open" "$TMP_DIR/t3-control";
+   PATH="$TMP_DIR/bin:$PATH"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-control";
+   NAME=missing; SESSION=thread-1; WEB_URL=http://127.0.0.1:3773/env/thread-1;
+   ! focus_t3code;
+   ! grep -q "http://" "$TMP_DIR/t3-opened"'
 
 matcher() {
   FOCUS_AGENT_LIB_ONLY=1 bash -c ". \"$SCRIPT\"; ssh_pane_for_host \"\$1\" \"\$2\"" _ "$1" "$2"
