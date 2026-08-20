@@ -200,14 +200,30 @@ static NSString *ax_string(AXUIElementRef element, CFStringRef attribute) {
     return text;
 }
 
+static NSString *normalized_label(NSString *text) {
+    if (text.length == 0) return @"";
+    NSString *folded = [[text lowercaseString]
+        stringByReplacingOccurrencesOfString:@"-" withString:@" "];
+    folded = [folded stringByReplacingOccurrencesOfString:@"_" withString:@" "];
+    NSArray<NSString *> *parts = [folded componentsSeparatedByCharactersInSet:
+        NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    for (NSString *part in parts) {
+        if (part.length) [kept addObject:part];
+    }
+    return [kept componentsJoinedByString:@" "];
+}
+
 static BOOL element_mentions(AXUIElementRef element, NSString *needle) {
     const CFStringRef attributes[] = {
         kAXTitleAttribute, kAXValueAttribute, kAXDescriptionAttribute,
         kAXHelpAttribute, CFSTR("AXPlaceholderValue")
     };
+    NSString *needleNorm = normalized_label(needle);
+    if (needleNorm.length == 0) return NO;
     for (NSUInteger index = 0; index < 5; index++) {
         NSString *text = ax_string(element, attributes[index]);
-        if (text.length && [text rangeOfString:needle options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        if (text.length && [normalized_label(text) rangeOfString:needleNorm].location != NSNotFound) {
             return YES;
         }
     }
@@ -269,6 +285,47 @@ static AXUIElementRef app_element(NSString *bundleID) {
     return app;
 }
 
+static BOOL button_geometry(AXUIElementRef button, CGPoint *position, CGSize *size) {
+    CFTypeRef positionValue = NULL;
+    CFTypeRef sizeValue = NULL;
+    BOOL ok =
+        AXUIElementCopyAttributeValue(button, kAXPositionAttribute, &positionValue) == kAXErrorSuccess &&
+        AXUIElementCopyAttributeValue(button, kAXSizeAttribute, &sizeValue) == kAXErrorSuccess &&
+        positionValue && sizeValue &&
+        CFGetTypeID(positionValue) == AXValueGetTypeID() &&
+        CFGetTypeID(sizeValue) == AXValueGetTypeID() &&
+        AXValueGetValue((AXValueRef)positionValue, kAXValueCGPointType, position) &&
+        AXValueGetValue((AXValueRef)sizeValue, kAXValueCGSizeType, size) &&
+        size->width > 0 && size->height > 0;
+    if (positionValue) CFRelease(positionValue);
+    if (sizeValue) CFRelease(sizeValue);
+    return ok;
+}
+
+static AXUIElementRef preferred_button(NSArray *matches, CGPoint *position, CGSize *size) {
+    AXUIElementRef best = NULL;
+    CGFloat bestArea = 0;
+    CGPoint bestPosition = CGPointZero;
+    CGSize bestSize = CGSizeZero;
+    for (id item in matches) {
+        AXUIElementRef button = (__bridge AXUIElementRef)item;
+        CGPoint candidatePosition = CGPointZero;
+        CGSize candidateSize = CGSizeZero;
+        if (!button_geometry(button, &candidatePosition, &candidateSize)) continue;
+        CGFloat area = candidateSize.width * candidateSize.height;
+        if (area > bestArea) {
+            best = button;
+            bestArea = area;
+            bestPosition = candidatePosition;
+            bestSize = candidateSize;
+        }
+    }
+    if (!best) return NULL;
+    *position = bestPosition;
+    *size = bestSize;
+    return best;
+}
+
 static void press_unique_button(NSString *bundleID, NSString *title) {
     NSArray<NSRunningApplication *> *running =
         [NSRunningApplication runningApplicationsWithBundleIdentifier:bundleID];
@@ -284,35 +341,19 @@ static void press_unique_button(NSString *bundleID, NSString *title) {
         visited = 0;
         collect_matching_buttons(app, title, 0, &visited, matches, NO);
     }
-    if (matches.count != 1) {
-        CFRelease(app);
-        fail([NSString stringWithFormat:@"expected one button containing '%@' in %@; found %lu",
-              title, bundleID, (unsigned long)matches.count], 5);
-    }
-    AXUIElementRef button = (__bridge AXUIElementRef)matches[0];
-    CFTypeRef positionValue = NULL;
-    CFTypeRef sizeValue = NULL;
     CGPoint position = CGPointZero;
     CGSize size = CGSizeZero;
-    BOOL hasGeometry =
-        AXUIElementCopyAttributeValue(button, kAXPositionAttribute, &positionValue) == kAXErrorSuccess &&
-        AXUIElementCopyAttributeValue(button, kAXSizeAttribute, &sizeValue) == kAXErrorSuccess &&
-        positionValue && sizeValue &&
-        CFGetTypeID(positionValue) == AXValueGetTypeID() &&
-        CFGetTypeID(sizeValue) == AXValueGetTypeID() &&
-        AXValueGetValue((AXValueRef)positionValue, kAXValueCGPointType, &position) &&
-        AXValueGetValue((AXValueRef)sizeValue, kAXValueCGSizeType, &size) &&
-        size.width > 0 && size.height > 0;
-    if (positionValue) CFRelease(positionValue);
-    if (sizeValue) CFRelease(sizeValue);
-    if (!hasGeometry) {
+    AXUIElementRef button = preferred_button(matches, &position, &size);
+    if (!button) {
         CFRelease(app);
-        fail(@"matched button has no clickable geometry", 5);
+        fail([NSString stringWithFormat:@"expected a clickable button containing '%@' in %@; found %lu",
+              title, bundleID, (unsigned long)matches.count], 5);
     }
     // Chromium advertises AXPress on its sidebar buttons but T3 Code 0.0.33
-    // ignores that action. A real click at the centre of the uniquely matched
-    // AX element navigates reliably. The caller still verifies the resulting
-    // thread URL, so a moved/stale element cannot be reported as success.
+    // ignores that action. A real click at the centre of the largest matching
+    // AX element is the sidebar thread row (the computer/thread tab). Hold the
+    // pointer there briefly so the operator can see the tab change, then put
+    // it back.
     CGPoint point = CGPointMake(position.x + size.width / 2.0,
                                 position.y + size.height / 2.0);
     CGEventRef pointerSnapshot = CGEventCreate(NULL);
@@ -324,12 +365,16 @@ static void press_unique_button(NSString *bundleID, NSString *title) {
         source, kCGEventLeftMouseDown, point, kCGMouseButtonLeft) : NULL;
     CGEventRef up = source ? CGEventCreateMouseEvent(
         source, kCGEventLeftMouseUp, point, kCGMouseButtonLeft) : NULL;
-    if (down) CGEventPost(kCGHIDEventTap, down);
+    if (down) {
+        CGWarpMouseCursorPosition(point);
+        CGEventPost(kCGHIDEventTap, down);
+    }
     if (up) {
         usleep(20000);
         CGEventPost(kCGHIDEventTap, up);
     }
     if (pointerSnapshot) {
+        usleep(200000);
         CGWarpMouseCursorPosition(originalPosition);
     }
     if (pointerSnapshot) CFRelease(pointerSnapshot);
@@ -526,7 +571,7 @@ int main(int argc, const char *argv[]) {
         }
         NSString *command = arguments.count ? arguments[0] : @"request-access";
         if ([command isEqualToString:@"version"]) {
-            return complete(@"9", 0, NO);
+            return complete(@"11", 0, NO);
         }
         if ([command isEqualToString:@"event-shape"]) {
             if (arguments.count != 4) {

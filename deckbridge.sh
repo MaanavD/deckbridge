@@ -327,7 +327,17 @@ start() {
 
   # T3 Code owns its thread lifecycle and publishes exact approval/input state.
   # Start the feed before the connector so the first board paint can include it.
-  spawn t3code_watcher "$PY" t3code_watcher.py
+  # Discover the Hermes SSH alias first so the same watcher can merge remote
+  # T3 threads from that box instead of only the local desktop environment.
+  if [ -z "$HERMES_SSH" ]; then
+    HERMES_SSH=$(detect_hermes_ssh || true)
+    [ -n "$HERMES_SSH" ] && ok "hermes_agents: using ssh alias '$HERMES_SSH' from ~/.ssh/config"
+  fi
+  if [ -n "$HERMES_SSH" ]; then
+    spawn t3code_watcher "$PY" t3code_watcher.py --ssh "$HERMES_SSH"
+  else
+    spawn t3code_watcher "$PY" t3code_watcher.py
+  fi
 
   # 2. unified agents/launchers own 0-9; fixed app shortcuts own 10-13
   # shellcheck disable=SC2086
@@ -347,10 +357,6 @@ start() {
   fi
 
   # 3. feeds: remote Hermes agent threads
-  if [ -z "$HERMES_SSH" ]; then
-    HERMES_SSH=$(detect_hermes_ssh || true)
-    [ -n "$HERMES_SSH" ] && ok "hermes_agents: using ssh alias '$HERMES_SSH' from ~/.ssh/config"
-  fi
   if [ -n "$HERMES_SSH" ]; then
     # Spawn even while offline.  The watcher owns bounded retries and health;
     # a one-shot startup preflight used to omit it permanently until the whole

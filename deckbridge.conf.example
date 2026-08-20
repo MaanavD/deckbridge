@@ -18,6 +18,7 @@
 # --- remote Hermes agents on keys 1-4 ----------------------------------------
 # SSH alias for the box running Hermes. Must work non-interactively:
 #   ssh -o BatchMode=yes hetzner true
+# The same alias is used to list T3 Code threads on that box.
 # HERMES_SSH=hetzner
 
 # --- Discord approval key 0 --------------------------------------------------

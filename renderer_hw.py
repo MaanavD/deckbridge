@@ -239,6 +239,20 @@ class HWRenderer:
         """Apply the current macOS lock state to the physical display."""
         return self.set_display_suspended(self._session_locked())
 
+    def assert_device_present(self) -> None:
+        """Fail when the opened deck has disappeared.
+
+        A static board and an unchanged lock state do no HID writes. Without
+        this probe an unplug leaves the renderer holding a dead handle, and a
+        replugged deck stays dark until the process is recycled.
+        """
+        deck = self.deck
+        if deck is None:
+            raise OSError("device disconnected")
+        probe = getattr(deck, "connected", None)
+        if probe is not None and not probe():
+            raise OSError("device disconnected")
+
     def blank_and_close(self) -> None:
         """Leave no stale illuminated frame when the renderer exits."""
         if self.deck is None:
@@ -540,25 +554,43 @@ class HWRenderer:
                 print(f"[hw] Stream Deck connection lost ({exc}); waiting for device")
                 await asyncio.sleep(DEVICE_RETRY_SECONDS)
 
+    async def _receive_frames(self, ws):
+        async for raw in ws:
+            msg = json.loads(raw)
+            if msg.get("type") == "welcome":
+                self.grid = msg.get("grid", self.grid)
+                if self.health is not None:
+                    self.health.ready(
+                        transport="websocket+hid", peer=self.ws_url,
+                        device="ready",
+                    )
+            elif msg.get("type") == "state":
+                self.faces = [dict(OFF_FACE, **f) for f in msg["faces"]]
+                self.push_all(time.time())
+
     async def _serve_connections(self):
         async for ws in self._reconnect():
             self._ws = ws
             animator = None
+            receiver = None
             try:
                 await ws.send(json.dumps({"type": "hello", "role": "renderer", "name": "hw-streamdeck"}))
                 animator = asyncio.create_task(self._animate())
-                async for raw in ws:
-                    msg = json.loads(raw)
-                    if msg.get("type") == "welcome":
-                        self.grid = msg.get("grid", self.grid)
-                        if self.health is not None:
-                            self.health.ready(
-                                transport="websocket+hid", peer=self.ws_url,
-                                device="ready",
-                            )
-                    elif msg.get("type") == "state":
-                        self.faces = [dict(OFF_FACE, **f) for f in msg["faces"]]
-                        self.push_all(time.time())
+                receiver = asyncio.create_task(self._receive_frames(ws))
+                # HID unplug is usually raised by the animator, not the
+                # websocket. If that task dies unobserved, this loop keeps the
+                # hub socket and never re-enumerates, so a replugged deck stays
+                # dark.
+                done, _pending = await asyncio.wait(
+                    {animator, receiver},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    if task.cancelled():
+                        continue
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
             except websockets.ConnectionClosed:
                 if self.health is not None:
                     self.health.degraded(
@@ -572,10 +604,17 @@ class HWRenderer:
                 # the first kept writing the same device, multiplying both HID
                 # traffic and CPU after every outage.
                 self._ws = None
-                if animator is not None:
-                    animator.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await animator
+                for task in (animator, receiver):
+                    if task is None:
+                        continue
+                    if not task.done():
+                        task.cancel()
+                    # A finished task re-raises its original error on await.
+                    # That must not replace a HID unplug or escape after a
+                    # handled websocket close. CancelledError is a
+                    # BaseException on the launchd Python 3.9.
+                    with suppress(asyncio.CancelledError, Exception):
+                        await task
 
     async def _reconnect(self):
         while True:
@@ -607,6 +646,7 @@ class HWRenderer:
             now = time.monotonic()
             if now >= getattr(self, "_next_power_check", float("inf")):
                 self._next_power_check = now + POWER_POLL_SECONDS
+                self.assert_device_present()
                 await asyncio.to_thread(self.refresh_display_power)
             if getattr(self, "_display_suspended", False):
                 # Keep health heartbeats alive while the Mac is locked, but do

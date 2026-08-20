@@ -34,6 +34,5 @@ chmod 600 "$temporary"
 mv "$temporary" "$TOKEN_PATH"
 trap - EXIT HUP INT TERM
 
-open -gj -a "T3 Code (Alpha)"
 echo "T3 Code is installed and Deckbridge credentialed at $TOKEN_PATH (mode 600)."
 echo "Add each project once in T3 Code; its threads will then appear automatically."

@@ -7,7 +7,7 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SOURCE="$ROOT/DeckbridgeMic.m"
 INFO_PLIST="$ROOT/DeckbridgeMic-Info.plist"
 APP_PATH="${DECKBRIDGE_MIC_APP:-$HOME/Applications/Deckbridge Mic.app}"
-EXPECTED_VERSION=9
+EXPECTED_VERSION=11
 
 helper_path() {
     printf '%s/Contents/MacOS/deckbridge-mic\n' "$APP_PATH"

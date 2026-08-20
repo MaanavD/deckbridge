@@ -24,10 +24,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import connector_agents as connector_module  # noqa: E402
 
 from connector_agents import (  # noqa: E402
-    AgentConnector, LocalLivenessProbe, SlotMap, agent_key, dedupe_labels, decay_stale,
-    drop_uninteresting, face_for, normalize_status, read_agents,
-    read_launchers, read_shortcuts, launcher_face, DEFAULT_LAUNCHERS,
-    DEFAULT_SHORTCUTS, LAUNCHER_COLOR,
+    AgentConnector, LocalLivenessProbe, SlotMap, agent_key, collapse_t3_shadows,
+    dedupe_labels, decay_stale, drop_uninteresting, face_for, normalize_status,
+    read_agents, read_launchers, read_shortcuts, launcher_face, workspace_identity,
+    DEFAULT_LAUNCHERS, DEFAULT_SHORTCUTS, LAUNCHER_COLOR,
     SOURCE_BADGE, STALE_WORKING_S, STATUS_FACE, STATUS_ORDER, slot_priority,
 )
 from connection_runtime import HealthReporter  # noqa: E402
@@ -74,9 +74,30 @@ def test_label_cleaning() -> None:
         names = [a["name"] for a in agents]
         check("cc-/cx- prefixes are stripped from labels", names == ["sample api", "sample api"],
               str(names))
+        check("the original title is kept for exact app targeting",
+              [a["title"] for a in agents] == ["cc-sample-api", "cx-sample_api"],
+              str([a["title"] for a in agents]))
         deduped = [a["name"] for a in dedupe_labels(agents)]
         check("identical labels get a numeric suffix", deduped == ["sample api", "sample api 2"],
               str(deduped))
+
+
+def test_t3_remote_identity_survives_state_read() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "t3.json"
+        write(path, [{
+            "name": "Hermes work", "status": "working", "source": "t3code-claude",
+            "session_id": "remote-1", "environment_id": "env-remote",
+            "ssh_host": "hermes", "environment_label": "maanav-hermes",
+            "url": "t3code://app/#/env-remote/remote-1",
+        }])
+        agents = read_agents(path, source_default="t3code")
+        check("remote T3 keeps its environment and ssh host",
+              agents[0]["environment_id"] == "env-remote"
+              and agents[0]["ssh_host"] == "hermes"
+              and agents[0]["environment_label"] == "maanav-hermes"
+              and agents[0]["url"].endswith("/remote-1"),
+              str(agents[0]))
 
 
 def test_badges_identify_the_tool() -> None:
@@ -488,6 +509,59 @@ def test_t3_managed_provider_children_are_not_separate_buttons() -> None:
         check("T3 provider subprocesses collapse into their authoritative thread",
               [(a["source"], a["name"]) for a in found]
               == [("t3code-codex", "Test2")], str(found))
+
+
+def test_workspace_identity_collapses_cursor_project_mirrors() -> None:
+    check("a real repo path becomes a hyphen slug",
+          workspace_identity("/Users/maanav/Downloads/deckbridge")
+          == "users-maanav-downloads-deckbridge")
+    check("a Cursor project mirror matches that repo",
+          workspace_identity("/Users/maanav/.cursor/projects/Users-maanav-Downloads-deckbridge")
+          == "users-maanav-downloads-deckbridge")
+    check("a home directory is too generic to match",
+          workspace_identity("/home/hermes") == "")
+
+
+def test_t3_cursor_thread_absorbs_matching_hook_and_hermes_shadows() -> None:
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write(root / "local.json", [
+            {"name": "Users maana", "status": "working", "source": "cursor-agent",
+             "session_id": "cursor-ide", "app": "Cursor",
+             "cwd": "/Users/maanav/.cursor/projects/Users-maanav-Downloads-deckbridge",
+             "updated_at": now},
+            {"name": "other repo", "status": "working", "source": "cursor-agent",
+             "session_id": "other-ide", "app": "Cursor",
+             "cwd": "/Users/maanav/Documents/photos",
+             "updated_at": now},
+        ])
+        write(root / "hermes.json", [{
+            "name": "remote cli", "status": "working", "source": "hermes-ssh",
+            "session_id": "ssh-1", "cwd": "/Users/maanav/Downloads/deckbridge",
+            "updated_at": now,
+        }])
+        write(root / "t3.json", [{
+            "name": "Fix Stream Deck Auto-Start", "status": "working",
+            "source": "t3code-cursor", "session_id": "thread-1",
+            "cwd": "/Users/maanav/Downloads/deckbridge",
+            "app": "T3 Code (Alpha)", "updated_at": now,
+        }])
+        connector = AgentConnector(
+            hermes_state=root / "hermes.json", local_state=root / "local.json",
+            desktop_state=root / "desktop.json", t3code_state=root / "t3.json",
+        )
+        found = [(a["source"], a["name"]) for a in connector.collect(now)]
+        check("the T3 Cursor thread is the only deckbridge Cursor key",
+              found == [("cursor-agent", "other repo"),
+                        ("t3code-cursor", "Fix Stream Deck Auto Start")],
+              str(found))
+        names = [a["name"] for a in collapse_t3_shadows([
+            {"source": "t3code-claude", "cwd": "/repo", "session_id": "t1", "name": "claude"},
+            {"source": "cursor-agent", "cwd": "/repo", "session_id": "c1", "name": "cursor"},
+        ])]
+        check("a T3 Claude thread does not hide a different-tool Cursor session",
+              names == ["claude", "cursor"], str(names))
 
 async def _noop_send(message: dict[str, Any]) -> None:
     """Swallow publishes in tests that only care about side effects."""
@@ -1056,6 +1130,13 @@ def test_focus_command_receives_agent_fields() -> None:
         text = out.read_text(encoding="utf-8").strip()
         check("focus substitutes source, name, and url",
               text == "hermes-discord|sample api|https://discord.com/channels/1/2", text)
+        out.unlink()
+        c.focus_cmd = f"printf '%s\\n' {{title}} >> {out}"
+        c.focus({"name": "Fix Stream Deck Auto Start",
+                 "title": "Fix Stream Deck Auto-Start",
+                 "source": "t3code-cursor"})
+        check("focus clicks the original T3 title, not the hyphen-stripped deck label",
+              out.read_text(encoding="utf-8").strip() == "Fix Stream Deck Auto-Start")
         # A template referencing an unknown field must not raise.
         c.focus_cmd = "echo {nope}"
         c.focus({"name": "x", "source": "cmux", "cwd": "", "url": "", "thread_id": ""})
@@ -1439,6 +1520,7 @@ def test_slow_focus_does_not_block_the_next_button_event() -> None:
 def main() -> int:
     test_normalize_status()
     test_label_cleaning()
+    test_t3_remote_identity_survives_state_read()
     test_badges_identify_the_tool()
     test_ssh_hosted_hermes_agents()
     test_remote_hermes_maps_to_a_unique_herdr_ssh_pane()
@@ -1454,6 +1536,8 @@ def main() -> int:
     test_merges_both_feeds()
     test_merges_native_desktop_surfaces()
     test_t3_managed_provider_children_are_not_separate_buttons()
+    test_workspace_identity_collapses_cursor_project_mirrors()
+    test_t3_cursor_thread_absorbs_matching_hook_and_hermes_shadows()
     test_pager_replaces_the_dead_overflow_key()
     test_every_agent_is_reachable_by_paging()
     test_paging_wraps_and_keeps_slots_still()

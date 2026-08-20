@@ -135,6 +135,17 @@ check_sh 'hermes-ssh reports the configured ssh host' \
 # The local T3 HTTP route requires a separate browser bootstrap credential.
 # Falling back to it from a native-app key strands the user on a pairing-token
 # screen, so exact native focus must fail closed instead of opening a browser.
+check_sh 'T3 focus is a no-op when the exact thread is already frontmost' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   printf "#!/bin/sh\necho \"\$*\" >> \"$TMP_DIR/t3-already\"; case \"\$1\" in\n  --helper-frontmost) echo \"T3 Code (Alpha)|com.t3tools.t3code\" ;;\n  --helper-web-url) echo t3code://app/\#/env/thread-1 ;;\n  *) exit 1 ;;\nesac\n" > "$TMP_DIR/t3-already-control";
+   chmod +x "$TMP_DIR/t3-already-control";
+   printf "#!/bin/sh\necho opened >> \"$TMP_DIR/t3-already-open\"; exit 0\n" > "$TMP_DIR/bin/open";
+   chmod +x "$TMP_DIR/bin/open";
+   PATH="$TMP_DIR/bin:$PATH"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-already-control";
+   DECKBRIDGE_DISABLE_HAMMERSPOON=1; NAME=task; SESSION=thread-1; focus_t3code;
+   ! test -f "$TMP_DIR/t3-already-open";
+   ! grep -q -- "--helper-press-button" "$TMP_DIR/t3-already"'
+
 check_sh 'T3 focus never opens its pairing-required browser route' \
   'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
    printf "#!/bin/sh\nprintf \"%%s\\n\" \"\$*\" >> \"$TMP_DIR/t3-opened\"\nexit 0\n" > "$TMP_DIR/bin/open";
@@ -156,11 +167,29 @@ check_sh 'T3 focus retries a transient native Accessibility miss' \
 
 check_sh 'T3 focus dismisses Settings before selecting the exact thread' \
   'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
-   printf "#!/bin/sh\necho \"\$*\" >> \"$TMP_DIR/t3-control-log\"\ncase \"\$1\" in\n  --helper-press-button) exit 0 ;;\n  --helper-web-url) echo t3code://app/\#/env/thread-1 ;;\nesac\n" > "$TMP_DIR/t3-settings-control";
+   printf "#!/bin/sh\necho \"\$*\" >> \"$TMP_DIR/t3-control-log\"\ncase \"\$1\" in\n  --helper-press-button) exit 0 ;;\n  --helper-web-url) if grep -q \"com.t3tools.t3code Back\" \"$TMP_DIR/t3-control-log\" 2>/dev/null; then echo t3code://app/\#/env/thread-1; else echo t3code://app/\#/settings; fi ;;\nesac\n" > "$TMP_DIR/t3-settings-control";
    chmod +x "$TMP_DIR/t3-settings-control";
    PATH="$TMP_DIR/bin:$PATH"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-settings-control";
    DECKBRIDGE_DISABLE_HAMMERSPOON=1; NAME=task; SESSION=thread-1; focus_t3code;
-   head -n 1 "$TMP_DIR/t3-control-log" | grep -q -- "--helper-press-button com.t3tools.t3code Back"'
+   grep -q -- "--helper-press-button com.t3tools.t3code Back" "$TMP_DIR/t3-control-log"'
+
+check_sh 'T3 focus clicks the sidebar thread row as the computer tab' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   printf "#!/bin/sh\necho \"\$*\" >> \"$TMP_DIR/t3-tab-log\"\ncase \"\$1\" in\n  --helper-press-button) exit 0 ;;\n  --helper-web-url) if grep -q \"Remote agent\" \"$TMP_DIR/t3-tab-log\" 2>/dev/null; then echo t3code://app/\#/env-remote/remote-1; else echo t3code://app/\#/env-local/other; fi ;;\n  --helper-frontmost) echo \"T3 Code (Alpha)|com.t3tools.t3code\" ;;\nesac\n" > "$TMP_DIR/t3-tab-control";
+   chmod +x "$TMP_DIR/t3-tab-control";
+   PATH="$TMP_DIR/bin:$PATH"; DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-tab-control";
+   DECKBRIDGE_DISABLE_HAMMERSPOON=1; NAME="Remote agent"; SESSION=remote-1;
+   ENVIRONMENT=env-remote; T3_SSH_HOST=hermes; focus_t3code;
+   first=$(grep -- "--helper-press-button" "$TMP_DIR/t3-tab-log" | head -n 1);
+   echo "$first" | grep -q "Remote agent"'
+
+check_sh 'T3 focus strips a truncated title before clicking the tab' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   [ "$(NAME="Lots of messiness in my hermes agent. can you figu..."; t3_thread_title)" = "Lots of messiness in my hermes agent. can you figu" ]'
+
+check_sh 'T3 focus keeps hyphens so a Cursor thread title still matches' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   [ "$(NAME="Fix Stream Deck Auto-Start"; t3_thread_title)" = "Fix Stream Deck Auto-Start" ]'
 
 check_sh 'T3 focus uses the durable Hammerspoon Accessibility bridge' \
   'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
@@ -173,14 +202,32 @@ check_sh 'T3 focus uses the durable Hammerspoon Accessibility bridge' \
 check_sh 'T3 focus verifies the LaunchServices Hammerspoon acknowledgement' \
   'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
    mkdir -p "$TMP_DIR/url-home/.deckbridge/t3-focus-results";
+   printf "#!/bin/sh\nexit 1\n" > "$TMP_DIR/t3-no-helper";
    printf "#!/bin/sh\ncase \"\$*\" in\n  *hammerspoon://*) u=\${!#}; q=\${u#*?}; session=\$(printf \"%%s\" \"\$q\" | tr \"&\" \"\\n\" | sed -n \"s/^session=//p\"); request=\$(printf \"%%s\" \"\$q\" | tr \"&\" \"\\n\" | sed -n \"s/^request=//p\"); mkdir -p \"\$HOME/.deckbridge/t3-focus-results\"; echo \"t3code://app/#/env/\$session\" > \"\$HOME/.deckbridge/t3-focus-results/\$request\" ;;\nesac\n" > "$TMP_DIR/bin/open";
-   chmod +x "$TMP_DIR/bin/open";
+   chmod +x "$TMP_DIR/bin/open" "$TMP_DIR/t3-no-helper";
    PATH="$TMP_DIR/bin:/usr/bin:/bin"; HOME="$TMP_DIR/url-home";
+   DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-no-helper";
    NAME=task; SESSION=thread-1; focus_t3code 2>&1 | grep -q "via Hammerspoon (verified)"'
+
+check_sh 'T3 focus asks Hammerspoon to select the computer tab first' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   mkdir -p "$TMP_DIR/comp-home/.deckbridge/t3-focus-results";
+   printf "#!/bin/sh\nexit 1\n" > "$TMP_DIR/t3-no-helper";
+   printf "#!/bin/sh\nprintf \"%%s\\n\" \"\$*\" >> \"$TMP_DIR/t3-hs-open\"; case \"\$*\" in\n  *hammerspoon://*) u=\${!#}; q=\${u#*?}; session=\$(printf \"%%s\" \"\$q\" | tr \"&\" \"\\n\" | sed -n \"s/^session=//p\"); request=\$(printf \"%%s\" \"\$q\" | tr \"&\" \"\\n\" | sed -n \"s/^request=//p\"); mkdir -p \"\$HOME/.deckbridge/t3-focus-results\"; echo \"t3code://app/#/env-remote/\$session\" > \"\$HOME/.deckbridge/t3-focus-results/\$request\" ;;\nesac\n" > "$TMP_DIR/bin/open";
+   chmod +x "$TMP_DIR/bin/open" "$TMP_DIR/t3-no-helper";
+   PATH="$TMP_DIR/bin:/usr/bin:/bin"; HOME="$TMP_DIR/comp-home";
+   DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-no-helper";
+   NAME="Remote agent"; SESSION=remote-1; ENVIRONMENT=env-remote; T3_SSH_HOST=hermes;
+   focus_t3code;
+   grep -q "computer=SGVybWVz" "$TMP_DIR/t3-hs-open"'
 
 check_sh 'T3 Hammerspoon focus restores the original pointer position' \
   'grep -q "local originalPosition = hs.mouse.absolutePosition()" hammerspoon_deckbridge.lua &&
    grep -q "hs.mouse.absolutePosition(originalPosition)" hammerspoon_deckbridge.lua'
+
+check_sh 'T3 Hammerspoon focus clicks an exact computer tab before the thread' \
+  'grep -q "decodeUrlBase64(params.computer" hammerspoon_deckbridge.lua &&
+   grep -q "t3Snapshot(app, computer, true)" hammerspoon_deckbridge.lua'
 
 check_sh 'T3 native focus fallback restores the original pointer position' \
   'grep -q "CGEventGetLocation(pointerSnapshot)" DeckbridgeMic.m &&

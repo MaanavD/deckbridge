@@ -846,6 +846,93 @@ class TestHardwareRenderer(unittest.TestCase):
         self.assertEqual(opens, 2)
         self.assertEqual(connections, 2)
 
+    def test_animation_tick_raises_when_the_deck_is_gone(self):
+        """A static board does no HID writes. The power poll must still notice
+        an unplug, or a replugged deck stays dark forever."""
+        r = self.renderer_hw.HWRenderer.__new__(self.renderer_hw.HWRenderer)
+        r.faces = [{"effect": "solid", "icon": "idle"}]
+        r._pressed_until = {}
+        r._display_suspended = False
+        r._next_power_check = 0.0
+        r.health = None
+        r.deck = mock.Mock(connected=mock.Mock(return_value=False))
+        r.refresh_display_power = lambda: None
+        r.push_indices = lambda indices, phase: None
+
+        sleeps = 0
+
+        async def one_tick(_delay):
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps > 2:
+                raise AssertionError("disconnected deck did not fail the animator")
+
+        with mock.patch.object(self.renderer_hw.asyncio, "sleep", one_tick):
+            with self.assertRaises(OSError):
+                asyncio.run(r._animate())
+
+    def test_renderer_reopens_after_an_animation_write_fails(self):
+        """An animator HID error must reopen the device, not die on a
+        background task while the websocket stays up and the deck stays dark."""
+        r = self.renderer_hw.HWRenderer(
+            "ws://unused", 45, session_locked=lambda: False)
+        opens = 0
+        connections = 0
+
+        class Deck:
+            def set_key_callback(self, callback):
+                self.callback = callback
+
+            def close(self):
+                pass
+
+            def connected(self):
+                return True
+
+        def open_again():
+            nonlocal opens
+            opens += 1
+            r.deck = Deck()
+            r.faces = [{"effect": "shimmer", "icon": "working"}]
+            return r.deck
+
+        class HoldOpen:
+            async def send(self, _message):
+                return None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Future()
+
+        async def connection_then_done():
+            nonlocal connections
+            connections += 1
+            if connections == 1:
+                yield HoldOpen()
+
+        def disconnected_indices(_indices, _phase):
+            raise OSError("device disconnected")
+
+        r.open_device = open_again
+        r._reconnect = connection_then_done
+        r.push_indices = disconnected_indices
+        r.push_all = lambda phase: None
+
+        async def bounded():
+            try:
+                await asyncio.wait_for(r.run(), timeout=1.0)
+            except asyncio.TimeoutError:
+                self.fail("animator HID error never reopened the device")
+
+        with mock.patch.object(self.renderer_hw.asyncio, "sleep",
+                               mock.AsyncMock(return_value=None)):
+            asyncio.run(bounded())
+
+        self.assertGreaterEqual(opens, 2)
+        self.assertGreaterEqual(connections, 2)
+
     def test_animation_tick_restores_a_key_after_press_flash_expires(self):
         """The final undimmed frame is written once, then the key goes quiet."""
         r = self.renderer_hw.HWRenderer.__new__(self.renderer_hw.HWRenderer)

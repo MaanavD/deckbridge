@@ -42,7 +42,7 @@ SCRIPT_NAME=${0##*/}
 # Bumped whenever focus resolution changes, so --diagnose and a failed press
 # both say which checkout actually ran. A stale extract alongside a fresh one
 # produces symptoms identical to a logic bug.
-BUILD_STAMP=2026-08-13.t3code-native-only
+BUILD_STAMP=2026-08-19.t3code-title-click
 DRY_RUN=0
 DIAGNOSE=0
 TTY_HINT=
@@ -62,6 +62,9 @@ CWD=
 URL=
 WEB_URL=
 SESSION=
+ENVIRONMENT=
+T3_SSH_HOST=
+T3_ENVIRONMENT_LABEL=
 
 usage() {
   cat <<'EOF'
@@ -142,6 +145,21 @@ parse_args() {
       --herdr-pane)
         [ "$#" -ge 2 ] || { error "--herdr-pane requires a value"; return 2; }
         HERDR_PANE_HINT=$2
+        shift 2
+        ;;
+      --environment)
+        [ "$#" -ge 2 ] || { error "--environment requires a value"; return 2; }
+        ENVIRONMENT=$2
+        shift 2
+        ;;
+      --ssh-host)
+        [ "$#" -ge 2 ] || { error "--ssh-host requires a value"; return 2; }
+        T3_SSH_HOST=$2
+        shift 2
+        ;;
+      --environment-label)
+        [ "$#" -ge 2 ] || { error "--environment-label requires a value"; return 2; }
+        T3_ENVIRONMENT_LABEL=$2
         shift 2
         ;;
       --launch)
@@ -1691,21 +1709,120 @@ deckbridge_control() {
   "$helper_cli" "$@"
 }
 
+t3_selected_url() {
+  deckbridge_control --helper-web-url com.t3tools.t3code 2>/dev/null || true
+}
+
+t3_url_matches_session() {
+  case "$1" in
+    *"/$SESSION"|*"/$SESSION/"*) return 0 ;;
+  esac
+  return 1
+}
+
+t3_computer_label() {
+  # T3's sidebar tab is the environment name ("Hermes"), not the SSH alias
+  # or the box hostname (maanav-hermes).
+  if [ -n "$T3_SSH_HOST" ]; then
+    local host=${T3_SSH_HOST##*@}
+    host=${host%%.*}
+    printf '%s%s\n' "$(printf '%s' "${host:0:1}" | tr '[:lower:]' '[:upper:]')" "${host:1}"
+    return 0
+  fi
+  if [ -n "$T3_ENVIRONMENT_LABEL" ]; then
+    printf '%s\n' "$T3_ENVIRONMENT_LABEL"
+    return 0
+  fi
+  return 1
+}
+
+t3_thread_title() {
+  printf '%s\n' "$NAME" | sed 's/[[:space:]]*\.\.\.$//'
+}
+
+t3_click_thread_tab() {
+  local title selected polls=0
+  title=$(t3_thread_title)
+  [ -n "$title" ] || return 1
+  deckbridge_control --helper-press-button com.t3tools.t3code "$title" >/dev/null 2>&1 || return 1
+  while [ "$polls" -lt 10 ]; do
+    selected=$(t3_selected_url)
+    if t3_url_matches_session "$selected"; then
+      printf 'focus_agent: focused exact T3 Code thread %s (verified)\n' "$SESSION"
+      return 0
+    fi
+    polls=$((polls + 1))
+    sleep 0.05
+  done
+  return 1
+}
+
+t3_url_matches_environment() {
+  [ -n "$ENVIRONMENT" ] || return 1
+  case "$1" in
+    *"$ENVIRONMENT"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Remote threads live on another T3 computer tab. Click that tab before the
+# thread title so the sidebar (and Hammerspoon) see the right environment.
+t3_switch_computer() {
+  local label selected tries=0
+  t3_computer_label >/dev/null || return 0
+  selected=$(t3_selected_url)
+  if t3_url_matches_environment "$selected"; then
+    return 0
+  fi
+  while [ "$tries" -lt 3 ]; do
+    tries=$((tries + 1))
+    label=$(t3_computer_label) || return 0
+    deckbridge_control --helper-press-button com.t3tools.t3code "$label" >/dev/null 2>&1 || true
+    selected=$(t3_selected_url)
+    if t3_url_matches_environment "$selected"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 0
+}
+
 focus_t3code() {
-  local selected polls attempts=0 title64 session64 request result_file
+  local selected polls attempts=0 title64 session64 request result_file front
   command -v open >/dev/null 2>&1 || return 1
-  open -a "T3 Code (Alpha)" >/dev/null 2>&1 || return 1
+  # A poll-loop `open -a` is what kept yanking T3 to the front. Key presses
+  # still need the app, but if it is already showing this thread, do nothing.
+  # Use the helper's frontmost read so tests and launchd agree on the same
+  # Accessibility-granted signal, not a separate System Events guess.
+  front=$(deckbridge_control --helper-frontmost 2>/dev/null || true)
+  case "$front" in
+    *com.t3tools.t3code*)
+      selected=$(t3_selected_url)
+      if t3_url_matches_session "$selected"; then
+        printf 'focus_agent: T3 Code thread %s already focused\n' "$SESSION"
+        return 0
+      fi
+      ;;
+    *)
+      open -a "T3 Code (Alpha)" >/dev/null 2>&1 || return 1
+      ;;
+  esac
+  # The sidebar thread row is the tab: it carries the computer name and the
+  # title. Click that row (largest matching button) before any Settings Back.
+  t3_click_thread_tab && return 0
+  t3_switch_computer
   # Prefer Hammerspoon's URL event bridge: LaunchServices delivers this to the
   # Accessibility-trusted GUI app even when hs's CLI/XPC connection is denied
   # to a LaunchAgent child. A request-scoped result file verifies the route.
   if [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] \
       && command -v base64 >/dev/null 2>&1; then
-    title64=$(printf '%s' "$NAME" | base64 | tr '+/' '-_' | tr -d '=\r\n')
+    title64=$(printf '%s' "$(t3_thread_title)" | base64 | tr '+/' '-_' | tr -d '=\r\n')
+    computer64=$(t3_computer_label 2>/dev/null | base64 | tr '+/' '-_' | tr -d '=\r\n')
     request="$$-$(date +%s)"
     result_file="$HOME/.deckbridge/t3-focus-results/$request"
     rm -f "$result_file"
     open -g -a Hammerspoon \
-      "hammerspoon://deckbridge-t3-focus?title=$title64&session=$SESSION&request=$request" \
+      "hammerspoon://deckbridge-t3-focus?title=$title64&session=$SESSION&computer=$computer64&request=$request" \
       >/dev/null 2>&1 || true
     polls=0
     while [ "$polls" -lt 60 ]; do
@@ -1728,9 +1845,10 @@ focus_t3code() {
   # not loaded yet. It is fast when available and preserves a graceful upgrade.
   if [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] \
       && command -v hs >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
-    title64=$(printf '%s' "$NAME" | base64 | tr -d '\r\n')
+    title64=$(printf '%s' "$(t3_thread_title)" | base64 | tr -d '\r\n')
     session64=$(printf '%s' "$SESSION" | base64 | tr -d '\r\n')
-    selected=$(hs -c "print(deckbridgeT3FocusB64('$title64','$session64'))" 2>/dev/null || true)
+    computer64=$(t3_computer_label 2>/dev/null | base64 | tr -d '\r\n')
+    selected=$(hs -c "print(deckbridgeT3FocusB64('$title64','$session64','$computer64'))" 2>/dev/null || true)
     case "$selected" in
       *"/$SESSION"|*"/$SESSION/"*)
         printf 'focus_agent: focused exact T3 Code thread %s via Hammerspoon (verified)\n' "$SESSION"
@@ -1738,34 +1856,14 @@ focus_t3code() {
         ;;
     esac
   fi
+  t3_switch_computer
+  t3_click_thread_tab && return 0
   # T3 hides the thread sidebar on Settings. Its native Back control restores
   # the last thread and is absent on an ordinary thread, so this is a safe,
   # idempotent preflight before selecting the exact requested title.
   deckbridge_control --helper-press-button com.t3tools.t3code Back >/dev/null 2>&1 || true
   sleep 0.05
-  # T3's Electron sidebar is briefly rebuilt after app activation, and AX can
-  # miss a button during that small window. Retry the exact titled control and
-  # verify its stable thread route after every successful click. We still fail
-  # closed: no title guess and no pairing-required browser fallback.
-  while [ "$attempts" -lt 3 ]; do
-    attempts=$((attempts + 1))
-    if ! deckbridge_control --helper-press-button com.t3tools.t3code "$NAME" >/dev/null 2>&1; then
-      sleep 0.1
-      continue
-    fi
-    polls=0
-    while [ "$polls" -lt 10 ]; do
-      selected=$(deckbridge_control --helper-web-url com.t3tools.t3code 2>/dev/null || true)
-      case "$selected" in
-        *"/$SESSION"|*"/$SESSION/"*)
-          printf 'focus_agent: focused exact T3 Code thread %s (verified)\n' "$SESSION"
-          return 0
-          ;;
-      esac
-      polls=$((polls + 1))
-      sleep 0.05
-    done
-  done
+  t3_click_thread_tab && return 0
   # The local HTTP route is not a safe fallback. Its browser client requires a
   # separate bootstrap pairing credential and cannot inherit the desktop-managed
   # session. Fail closed here instead of stranding the operator on a token prompt.

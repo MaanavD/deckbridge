@@ -80,9 +80,11 @@ TAILSCALE_AUTH_URL = re.compile(
     r"https://login\.tailscale\.com/a/[A-Za-z0-9]+"
 )
 DEFAULT_FOCUS_CMD = (
-    "./focus_agent.sh --source {source} --name {name} --cwd {cwd} "
+    "./focus_agent.sh --source {source} --name {title} --cwd {cwd} "
     "--url {url} --session {session_id} --tty {tty} --app {app} "
-    "--surface {surface} --herdr-pane {herdr_pane} --web-url {web_url}"
+    "--surface {surface} --herdr-pane {herdr_pane} --web-url {web_url} "
+    "--environment {environment_id} --ssh-host {ssh_host} "
+    "--environment-label {environment_label}"
 )
 
 #: Agents untouched for longer than this drop off the board entirely.
@@ -94,6 +96,12 @@ STALE_WORKING_S = 300.0
 LIVENESS_CACHE_S = 5.0
 LOCAL_SESSION_SOURCES = frozenset({"claude-code", "codex-cli", "cursor-agent"})
 T3CODE_HOST_APPS = frozenset({"t3 code", "t3 code (alpha)"})
+#: Hook/desktop/Hermes-CLI records that are the same work as a T3 thread.
+T3_SHADOW_SOURCES = {
+    "t3code-cursor": frozenset({"cursor-agent", "cursor-desktop"}),
+    "t3code-claude": frozenset({"claude-code", "claude-desktop"}),
+    "t3code-codex": frozenset({"codex-cli", "codex-desktop"}),
+}
 
 VALID_STATUSES = ("blocked", "working", "done", "idle")
 STATUS_ORDER = {"idle": 0, "done": 1, "working": 2, "blocked": 3}
@@ -319,7 +327,8 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
     for item in raw:
         if not isinstance(item, dict):
             continue
-        name = _clean_label(item.get("name") or item.get("title") or "")
+        raw_title = str(item.get("name") or item.get("title") or "").strip()
+        name = _clean_label(raw_title)
         if not name:
             continue
         source = str(item.get("source") or source_default)
@@ -332,6 +341,10 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
             updated_at = 0.0
         agents.append({
             "name": name,
+            # Deck keys strip hyphens for the 12-char face. T3's sidebar still
+            # shows the original title, and that is the string the click must
+            # search for.
+            "title": raw_title,
             "status": normalize_status(item.get("status")),
             "source": source,
             "cwd": str(item.get("cwd") or ""),
@@ -339,10 +352,12 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
             "web_url": str(item.get("web_url") or ""),
             "thread_id": str(item.get("thread_id") or ""),
             "session_id": str(item.get("session_id") or ""),
+            "environment_id": str(item.get("environment_id") or ""),
             # For a remote terminal session this is the exact SSH alias used
             # by the local watcher. It lets the Mac map the remote DB record to
             # a Herdr pane whose foreground process is `ssh <alias>`.
             "ssh_host": str(item.get("ssh_host") or ""),
+            "environment_label": str(item.get("environment_label") or ""),
             # A surface id the agent named itself. Strongest signal there is:
             # unlike a tty it needs no lookup, and unlike a cwd it identifies
             # ONE tab rather than every tab open in the same directory.
@@ -386,6 +401,66 @@ def is_t3_managed_provider_child(agent: dict[str, Any]) -> bool:
     """
     app = str(agent.get("app") or "").strip().casefold()
     return app in T3CODE_HOST_APPS and agent.get("source") in LOCAL_SESSION_SOURCES
+
+
+def workspace_identity(cwd: Any) -> str:
+    """Return a comparable workspace key, or empty when the path is too generic.
+
+    Cursor IDE hooks record ``~/.cursor/projects/<slash-path-with-hyphens>``
+    while T3 records the real repo path. Those must collapse to one identity.
+    Home directories and other two-component paths stay unmatched so a T3
+    thread at ``/home/hermes`` cannot swallow every Hermes CLI session.
+    """
+    raw = os.path.expanduser(str(cwd or "")).replace("\\", "/").rstrip("/")
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    marker = "/.cursor/projects/"
+    if marker in lowered:
+        slug = lowered.split(marker, 1)[1].split("/", 1)[0]
+    else:
+        slug = lowered.lstrip("/").replace("/", "-")
+    if slug.count("-") < 2:
+        return ""
+    return slug
+
+
+def collapse_t3_shadows(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the T3 thread when Hermes or a hook is watching the same session."""
+    t3 = [agent for agent in agents
+          if str(agent.get("source") or "").startswith("t3code")]
+    if not t3:
+        return agents
+    sessions = {
+        str(agent.get("session_id") or agent.get("thread_id") or "")
+        for agent in t3
+    }
+    sessions.discard("")
+    workspaces: dict[str, set[str]] = {}
+    for agent in t3:
+        identity = workspace_identity(agent.get("cwd"))
+        if not identity:
+            continue
+        workspaces.setdefault(identity, set()).add(str(agent.get("source") or ""))
+    out: list[dict[str, Any]] = []
+    for agent in agents:
+        source = str(agent.get("source") or "")
+        if source.startswith("t3code") or source.startswith("hermes-discord") \
+                or source.startswith("hermes-health"):
+            out.append(agent)
+            continue
+        session = str(agent.get("session_id") or agent.get("thread_id") or "")
+        if session and session in sessions:
+            continue
+        identity = workspace_identity(agent.get("cwd"))
+        owners = workspaces.get(identity, set())
+        if identity and owners:
+            if source == "hermes-ssh":
+                continue
+            if any(source in T3_SHADOW_SOURCES.get(owner, ()) for owner in owners):
+                continue
+        out.append(agent)
+    return out
 
 
 def read_viewed(path: Path) -> list[dict[str, str]]:
@@ -1199,6 +1274,7 @@ class AgentConnector:
         # still exposes the exact deep-link route.
         agents += read_agents(self.desktop_state, source_default="desktop")
         agents += read_agents(self.t3code_state, source_default="t3code")
+        agents = collapse_t3_shadows(agents)
         agents = decay_stale(agents, current)
         agents = drop_uninteresting(agents, current, self.max_age_hours)
         agents = dedupe_labels(agents)
@@ -1452,6 +1528,7 @@ end run
         try:
             command = self.focus_cmd.format(
                 name=shlex.quote(agent.get("name", "")),
+                title=shlex.quote(agent.get("title") or agent.get("name", "")),
                 cwd=shlex.quote(agent.get("cwd", "")),
                 url=shlex.quote(agent.get("url", "")),
                 web_url=shlex.quote(agent.get("web_url", "")),
@@ -1462,6 +1539,9 @@ end run
                 app=shlex.quote(agent.get("app", "")),
                 surface=shlex.quote(agent.get("surface", "")),
                 herdr_pane=shlex.quote(agent.get("herdr_pane", "")),
+                environment_id=shlex.quote(agent.get("environment_id", "")),
+                ssh_host=shlex.quote(agent.get("ssh_host", "")),
+                environment_label=shlex.quote(agent.get("environment_label", "")),
             )
         except (KeyError, ValueError, IndexError) as exc:
             log.warning("invalid focus template %r: %s", self.focus_cmd, exc)

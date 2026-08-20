@@ -10,6 +10,10 @@ local function clean(value)
     return tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+local function t3Normalized(value)
+    return clean(value):lower():gsub("[-_]", " "):gsub("%s+", " ")
+end
+
 local function lower(value)
     return string.lower(clean(value))
 end
@@ -112,8 +116,10 @@ local function scanT3(element, result, depth)
     end
     if role == "AXButton" then
         for _, label in ipairs({title, description, value}) do
-            local matches = result.target == "Back" and label == result.target
-                or result.target ~= "" and label:find(result.target, 1, true)
+            local matches = result.exact and label == result.target
+                or (not result.exact and result.target == "Back" and label == result.target)
+                or (not result.exact and result.target ~= "" and result.target ~= "Back"
+                    and t3Normalized(label):find(t3Normalized(result.target), 1, true))
             if matches then
                 local position = element:attributeValue("AXPosition") or {}
                 local size = element:attributeValue("AXSize") or {}
@@ -134,9 +140,9 @@ local function scanT3(element, result, depth)
     end
 end
 
-local function t3Snapshot(app, target)
+local function t3Snapshot(app, target, exact)
     local result = {target = target, matches = {}, matchSeen = {},
-                    url = "", visited = 0}
+                    url = "", visited = 0, exact = exact and true or false}
     local axApp = hs.axuielement.applicationElement(app)
     local windows = axApp and axApp:attributeValue("AXWindows") or nil
     for _, window in ipairs(windows or {}) do scanT3(window, result, 0) end
@@ -146,27 +152,55 @@ end
 local function clickT3Element(element)
     -- T3's Chromium controls advertise AXPress but currently ignore that
     -- action. A click at the exact Accessibility bounds works reliably and
-    -- does not require guessing coordinates. Preserve the operator's pointer
-    -- position because eventtap emits a real click at the target bounds.
+    -- does not require guessing coordinates. Leave the pointer on the tab
+    -- long enough to see the change, then put it back.
     local position = element:attributeValue("AXPosition")
     local size = element:attributeValue("AXSize")
     if not position or not size then return false end
     local originalPosition = hs.mouse.absolutePosition()
-    hs.eventtap.leftClick({x = position.x + size.w / 2,
-                           y = position.y + size.h / 2})
+    local point = {x = position.x + size.w / 2, y = position.y + size.h / 2}
+    hs.mouse.absolutePosition(point)
+    hs.eventtap.leftClick(point)
+    hs.timer.usleep(200000)
     hs.mouse.absolutePosition(originalPosition)
     return true
 end
 
-function deckbridgeT3FocusB64(title64, session64)
+local function t3ElementArea(element)
+    local size = element and element:attributeValue("AXSize") or nil
+    if not size then return 0 end
+    return (size.w or 0) * (size.h or 0)
+end
+
+local function t3LargestMatch(matches)
+    local best, bestArea = nil, 0
+    for _, element in ipairs(matches or {}) do
+        local area = t3ElementArea(element)
+        if area > bestArea then
+            best, bestArea = element, area
+        end
+    end
+    return best
+end
+
+function deckbridgeT3FocusB64(title64, session64, computer64)
     local title = hs.base64.decode(title64 or "") or ""
     local session = hs.base64.decode(session64 or "") or ""
+    local computer = hs.base64.decode(computer64 or "") or ""
     if title == "" or session == "" then return "" end
     local app = hs.application.get("com.t3tools.t3code")
         or hs.application.get("T3 Code (Alpha)")
     if not app then return "" end
     app:activate(true)
     hs.timer.usleep(50000)
+
+    if computer ~= "" then
+        local tab = t3Snapshot(app, computer, true)
+        if #tab.matches > 0 then
+            clickT3Element(t3LargestMatch(tab.matches) or tab.matches[1])
+            hs.timer.usleep(100000)
+        end
+    end
 
     -- Settings hides the thread sidebar. Its Back button restores the previous
     -- thread; it is absent on the normal thread surface.
@@ -179,7 +213,8 @@ function deckbridgeT3FocusB64(title64, session64)
     for attempt = 1, 3 do
         local target = t3Snapshot(app, title)
         if #target.matches > 0 then
-            local candidate = target.matches[((attempt - 1) % #target.matches) + 1]
+            local candidate = t3LargestMatch(target.matches)
+                or target.matches[((attempt - 1) % #target.matches) + 1]
             clickT3Element(candidate)
             for _ = 1, 20 do
                 hs.timer.usleep(50000)
@@ -228,14 +263,14 @@ hs.urlevent.bind("deckbridge-t3-focus", function(_, params)
         os.rename(temporary, final)
     end
     local title = decodeUrlBase64(params.title or "")
+    local computer = decodeUrlBase64(params.computer or "")
     local suffix = "/" .. session
     local attempts = 0
     local backCount = -1
     local function selectThread()
         attempts = attempts + 1
         local target = t3Snapshot(app, title)
-        local candidate = #target.matches > 0
-            and target.matches[((attempts - 1) % #target.matches) + 1] or nil
+        local candidate = t3LargestMatch(target.matches)
         if not candidate or not clickT3Element(candidate) then
             if attempts < 3 then hs.timer.doAfter(0.1, selectThread)
             else
@@ -268,12 +303,23 @@ hs.urlevent.bind("deckbridge-t3-focus", function(_, params)
     -- a timer so activation and synthetic clicks can be delivered between AX
     -- scans instead of being blocked by a synchronous callback.
     hs.timer.doAfter(0.25, function()
-        local back = t3Snapshot(app, "Back")
-        backCount = #back.matches
-        if #back.matches > 0 and clickT3Element(back.matches[1]) then
-            hs.timer.doAfter(0.15, selectThread)
+        local function afterComputer()
+            local back = t3Snapshot(app, "Back")
+            backCount = #back.matches
+            if #back.matches > 0 and clickT3Element(back.matches[1]) then
+                hs.timer.doAfter(0.15, selectThread)
+            else
+                selectThread()
+            end
+        end
+        if computer ~= "" then
+            local tab = t3Snapshot(app, computer, true)
+            if #tab.matches > 0 then
+                clickT3Element(t3LargestMatch(tab.matches) or tab.matches[1])
+            end
+            hs.timer.doAfter(0.1, afterComputer)
         else
-            selectThread()
+            afterComputer()
         end
     end)
 end)
