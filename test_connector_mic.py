@@ -60,7 +60,7 @@ def test_defaults() -> None:
           and IDLE_FACE["icon"] is None)
     check("idle and fired faces are visually distinct without status prose",
           IDLE_FACE["color"] != FIRED_FACE["color"]
-          and IDLE_FACE["sublabel"] == FIRED_FACE["sublabel"] == "hold to talk")
+          and IDLE_FACE["sublabel"] == FIRED_FACE["sublabel"] == "dictation")
     check("the fired face animates", FIRED_FACE["effect"] == "breathe")
 
 
@@ -188,7 +188,7 @@ def test_failed_action_never_claims_listening() -> None:
     check("a failed mic action never paints the active face",
           FIRED_FACE not in painted, str(painted))
     check("a failed mic action keeps the simple purple face",
-          painted and all(face["sublabel"] == "hold to talk" for face in painted),
+          painted and all(face["sublabel"] == "dictation" for face in painted),
           str(painted))
     check("failure detail stays available outside the tiny key face",
           painted[-1].get("_diagnostic") == "error", str(painted))
@@ -198,7 +198,7 @@ def test_accessibility_failure_is_actionable() -> None:
     c = MicConnector(key=14)
     face = c._face_for_result(ActionResult(False, 4, "not trusted"))
     check("Accessibility failure is retained for diagnostics, not key prose",
-          face == ACCESS_FACE and face["sublabel"] == "hold to talk"
+          face == ACCESS_FACE and face["sublabel"] == "dictation"
           and face.get("_diagnostic") == "accessibility", str(face))
 
 
@@ -370,7 +370,7 @@ def test_locked_action_has_distinct_persistent_feedback() -> None:
     asyncio.run(go())
     painted = [m["face"] for m in ws.sent if m.get("type") == "face"]
     check("a locked action stays visually simple but remains diagnosable",
-          painted and all(face["sublabel"] == "hold to talk" for face in painted)
+          painted and all(face["sublabel"] == "dictation" for face in painted)
           and painted[-1].get("_diagnostic") == "locked", str(painted))
 
 

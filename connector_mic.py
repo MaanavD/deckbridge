@@ -53,7 +53,7 @@ ACCESSIBILITY_EXIT_CODE = 4
 # keeps the same purple, large-icon face so error prose never crowds the key.
 MIC_FACE = {
     "label": "",
-    "sublabel": "hold to talk",
+    "sublabel": "dictation",
     "badge": "",
     "source": "mic",
     "color": "#5b3fa8",

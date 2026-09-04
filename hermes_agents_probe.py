@@ -81,6 +81,16 @@ SOURCE_TAGS = {
     "tui": "hermes-ssh",
 }
 
+# Hermes (and some gateways) start a throwaway CLI session whose entire prompt
+# is "return PONG" / "ping" to prove the binary is alive. Those sessions have
+# no thread, live in /tmp, and otherwise look like finished work, so they steal
+# a deck key until they age out. Match only a title that *is* the probe, not a
+# real task that happens to mention ping-pong.
+_LIVENESS_TITLE = re.compile(
+    r"^(?:return\s+)?pong$|^ping$",
+    re.IGNORECASE,
+)
+
 
 def _activity_value(value: Any) -> float:
     """Convert a database activity timestamp to a sortable number."""
@@ -110,6 +120,26 @@ def short_label(title: Any, thread_id: str) -> str:
                 return label
     tail = str(thread_id)[-4:] if thread_id else ""
     return f"agent {tail}".rstrip() if tail else "agent"
+
+
+def is_liveness_probe_session(agent: dict[str, Any]) -> bool:
+    """True for throwaway ping/pong health-check sessions, not real work."""
+    for key in ("title", "name"):
+        text = re.sub(r"\s+", " ", str(agent.get(key) or "")).strip()
+        if text and _LIVENESS_TITLE.fullmatch(text):
+            return True
+    return False
+
+
+def drop_liveness_probes(document: dict[str, Any]) -> dict[str, Any]:
+    """Strip ping/pong health checks from a probe document, in place."""
+    agents = document.get("agents")
+    if isinstance(agents, list):
+        document["agents"] = [
+            item for item in agents
+            if not (isinstance(item, dict) and is_liveness_probe_session(item))
+        ]
+    return document
 
 
 def infer_status(
@@ -200,6 +230,21 @@ def _row_precedence(row: sqlite3.Row) -> tuple[int, float]:
     return (live, _activity_value(row["last_activity_at"]))
 
 
+def is_anonymous_discord_bookkeeping_row(row: sqlite3.Row) -> bool:
+    """Return whether a Discord row is bookkeeping rather than a session.
+
+    Hermes can emit a short-lived parent-channel record when it creates or
+    closes work elsewhere.  It has no thread, title, workspace, or activity,
+    and Deckbridge can only render an opaque ``agent abcd`` fallback for it.
+    A named or active channel-level session remains eligible for the deck.
+    """
+    if str(row["source"] or "").strip().lower() != "discord":
+        return False
+    return not any(str(_row_value(row, field) or "").strip() for field in (
+        "thread_id", "title", "cwd", "last_activity_description",
+    ))
+
+
 def probe(
     db_path: str | Path = DEFAULT_DB,
     *,
@@ -268,6 +313,8 @@ def probe(
 
     newest: dict[str, sqlite3.Row] = {}
     for row in rows:
+        if is_anonymous_discord_bookkeeping_row(row):
+            continue
         raw_thread_id = row["thread_id"]
         thread_id = "" if raw_thread_id is None else str(raw_thread_id).strip()
         # Discord rows collapse per thread (Hermes writes one row per context
@@ -288,6 +335,7 @@ def probe(
     agents = [
         _row_to_agent(row, guild_id=str(guild_id), now=current) for row in ranked
     ]
+    agents = [agent for agent in agents if not is_liveness_probe_session(agent)]
     if active_only:
         agents = [a for a in agents if a["status"] != "idle"]
     # Most urgent first, then most recent, so a truncating limit keeps the

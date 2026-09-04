@@ -310,6 +310,17 @@ def main() -> int:
             last_activity_description="thinking", cwd="/home/hermes",
             chat_id="222222222222222222",
         )
+        # Hermes also writes short-lived bookkeeping rows into the parent
+        # channel. They have no thread, title, workspace, or activity, so the
+        # only label Deckbridge can offer is an opaque ``agent abcd`` suffix.
+        # They are not a session an operator can return to.
+        insert(
+            chan_db,
+            id="sess_anonymous_channel", source="discord", archived=0,
+            thread_id=None, title=None, last_activity_at=now - 10,
+            last_activity_description="", cwd=None,
+            chat_id="222222222222222222",
+        )
         insert(
             chan_db,
             id="sess_thread", source="discord", archived=0,
@@ -332,6 +343,8 @@ def main() -> int:
               chan.get("sess_channel", {}).get("url", "").endswith(
                   "/222222222222222222"),
               str(chan.get("sess_channel", {}).get("url")))
+        check("anonymous Discord bookkeeping rows never occupy a deck key",
+              "sess_anonymous_channel" not in chan, str(sorted(chan)))
         check("thread URL still wins over channel id when a thread exists",
               chan.get("sess_thread", {}).get("url", "").endswith(
                   "/333333333333333333"),
@@ -339,6 +352,39 @@ def main() -> int:
         check("ssh agent gets no URL even when a chat_id exists",
               chan.get("sess_term", {}).get("url") == "",
               str(chan.get("sess_term", {}).get("url")))
+
+        # Hermes CLI health checks title themselves from the prompt ("Return
+        # PONG") and otherwise look like a finished agent. They must not occupy
+        # a deck key; a real session whose title merely mentions ping stays.
+        pong_db = Path(tmp) / "pong.sqlite"
+        make_db(pong_db)
+        insert(
+            pong_db,
+            id="sess_pong", source="cli", archived=0, thread_id="",
+            title="Return PONG", last_activity_at=now - 60,
+            last_activity_description="", cwd="/tmp",
+        )
+        insert(
+            pong_db,
+            id="sess_real", source="discord", archived=0,
+            thread_id="4444444444444444444", title="Ping pong high score",
+            last_activity_at=now - 10,
+            last_activity_description="thinking", cwd="/home/hermes",
+        )
+        pong = {
+            a["session_id"]: a
+            for a in run_probe(pong_db, "--all", "--limit", "50")["agents"]
+        }
+        check("CLI Return PONG health checks never reach the deck",
+              "sess_pong" not in pong, str(sorted(pong)))
+        check("a real ping-pong title is not treated as a health check",
+              "sess_real" in pong, str(sorted(pong)))
+        check("Return PONG is classified as a liveness probe",
+              hermes_agents_probe.is_liveness_probe_session(
+                  {"title": "Return PONG", "name": "Return PONG"}))
+        check("an ordinary title is not a liveness probe",
+              not hermes_agents_probe.is_liveness_probe_session(
+                  {"title": "Ping pong high score", "name": "Ping pong"}))
 
     missing = Path(tmp) / "missing.sqlite"
     failed = subprocess.run(

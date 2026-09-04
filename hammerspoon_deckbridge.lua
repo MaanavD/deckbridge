@@ -323,3 +323,253 @@ hs.urlevent.bind("deckbridge-t3-focus", function(_, params)
         end
     end)
 end)
+
+-- Dictation and hold-to-talk keystrokes have the same launchd TCC problem as
+-- T3 clicks: Deckbridge Mic can be trusted from Terminal and still denied when
+-- the LaunchAgent is the responsible parent. Hammerspoon is a trusted GUI
+-- parent, so spawn the real helper from here instead of synthesizing keys in
+-- Lua. Fn/Globe must be flagsChanged, matching DeckbridgeMic.m; that is the
+-- helper's job. Edit > Start Dictation is the native command when the app
+-- exposes it, and it is not a guessed hotkey.
+local modifierFlag = {
+    [54] = "cmd", [55] = "cmd",
+    [56] = "shift", [60] = "shift",
+    [58] = "alt", [61] = "alt",
+    [59] = "ctrl", [62] = "ctrl",
+    [63] = "fn",
+}
+
+local function parseKeyFlags(flags, code, down)
+    local tableFlags = {}
+    if flags and flags ~= "" and flags ~= "none" then
+        for part in string.gmatch(flags, "[^,]+") do
+            if part == "control" then tableFlags.ctrl = true
+            elseif part == "shift" then tableFlags.shift = true
+            elseif part == "option" then tableFlags.alt = true
+            elseif part == "command" then tableFlags.cmd = true
+            elseif part == "function" then tableFlags.fn = true
+            end
+        end
+    end
+    local own = modifierFlag[code]
+    if own and not down then tableFlags[own] = nil end
+    return tableFlags, own
+end
+
+local function postDictationKey(code, flags, down)
+    local tableFlags, own = parseKeyFlags(flags, code, down)
+    local event = hs.eventtap.event.newEvent()
+    if own then
+        event:setType(hs.eventtap.event.types.flagsChanged)
+    else
+        event:setType(down and hs.eventtap.event.types.keyDown
+            or hs.eventtap.event.types.keyUp)
+    end
+    event:setKeyCode(code)
+    event:setFlags(tableFlags)
+    event:post()
+end
+
+local function shellQuote(value)
+    return '"' .. tostring(value):gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
+end
+
+local function micHelperPath()
+    return os.getenv("HOME") .. "/Applications/Deckbridge Mic.app/Contents/MacOS/deckbridge-mic"
+end
+
+local function runMicHelper(args)
+    local cmd = shellQuote(micHelperPath())
+    for _, arg in ipairs(args) do
+        cmd = cmd .. " " .. shellQuote(arg)
+    end
+    local _, ok = hs.execute(cmd)
+    return ok == true
+end
+
+local function dictationMenuTitles(start)
+    if start then
+        return {"Start Dictation…", "Start Dictation"}
+    end
+    return {"Stop Dictation", "Stop Dictation…"}
+end
+
+local function selectDictationMenu(start)
+    local app = hs.application.frontmostApplication()
+    if not app then return false end
+    for _, title in ipairs(dictationMenuTitles(start)) do
+        local item = app:findMenuItem({"Edit", title})
+        if item and item.enabled then
+            return app:selectMenuItem({"Edit", title}) and true or false
+        end
+    end
+    return false
+end
+
+local function tapMicHelper(code, flags)
+    if runMicHelper({"tap", tostring(code), flags}) then return true end
+    postDictationKey(code, flags, true)
+    hs.timer.usleep(20000)
+    postDictationKey(code, flags, false)
+    return true
+end
+
+local function dictationHotkeyParts(hotkey)
+    local parts = {}
+    if hotkey == nil or hotkey == "" or hotkey == "none" then
+        return parts
+    end
+    for part in string.gmatch(hotkey, "[^,]+") do
+        if part == "fn" or part == "globe" then
+            table.insert(parts, {code = 63, flags = "function"})
+        elseif part == "ctrl" or part == "control" then
+            table.insert(parts, {code = 59, flags = "control"})
+        elseif part == "cmd" or part == "command" then
+            table.insert(parts, {code = 55, flags = "command"})
+        elseif part == "rcmd" or part == "rightcommand" then
+            table.insert(parts, {code = 54, flags = "command"})
+        elseif part == "f5" then
+            table.insert(parts, {code = 96, flags = "none"})
+        elseif part == "mic" or part == "microphone" then
+            table.insert(parts, {kind = "mic"})
+        elseif part:match("^%d+$") then
+            table.insert(parts, {code = tonumber(part), flags = "none"})
+        end
+    end
+    return parts
+end
+
+local function tapDictationHotkey(hotkey)
+    local parts = dictationHotkeyParts(hotkey)
+    if #parts == 0 then return false end
+    for index, part in ipairs(parts) do
+        if index > 1 then hs.timer.usleep(100000) end
+        if part.kind == "mic" then
+            if not runMicHelper({"tap-mic"}) then return false end
+        elseif not tapMicHelper(part.code, part.flags) then
+            return false
+        end
+    end
+    return true
+end
+
+local function startNativeDictation(hotkey)
+    if selectDictationMenu(true) then return true end
+    return tapDictationHotkey(hotkey)
+end
+
+local function stopNativeDictation(hotkey)
+    if selectDictationMenu(false) then return true end
+    return tapDictationHotkey(hotkey)
+end
+
+local function toggleNativeDictation(hotkey)
+    -- Prefer Edit > Start Dictation. Stop is the counterpart when already
+    -- listening. The Keyboard shortcut is only the fallback.
+    if selectDictationMenu(true) then return true end
+    if selectDictationMenu(false) then return true end
+    return tapDictationHotkey(hotkey)
+end
+
+local function textMentions(element, needle)
+    local blob = lower(table.concat({
+        clean(element:attributeValue("AXTitle")),
+        clean(element:attributeValue("AXDescription")),
+        clean(element:attributeValue("AXPlaceholderValue")),
+        clean(element:attributeValue("AXValue")),
+        clean(element:attributeValue("AXHelp")),
+    }, " "))
+    return blob:find(needle, 1, true) ~= nil
+end
+
+local function focusTextEntry(element, preferred, depth, visited)
+    if not element or depth > 40 or visited.count >= 30000 then return false end
+    visited.count = visited.count + 1
+    local role = clean(element:attributeValue("AXRole"))
+    local textRole = role == "AXTextArea" or role == "AXTextField"
+    if textRole and (not preferred
+            or textMentions(element, "ask")
+            or textMentions(element, "message")
+            or textMentions(element, "prompt")) then
+        if element:setAttributeValue("AXFocused", true) then return true end
+    end
+    for _, child in ipairs(element:attributeValue("AXChildren") or {}) do
+        if focusTextEntry(child, preferred, depth + 1, visited) then return true end
+    end
+    return false
+end
+
+local function deckbridgeFocusTextEntry(bundle)
+    local app = hs.application.get(bundle)
+    if not app then return false end
+    local axApp = hs.axuielement.applicationElement(app)
+    if not axApp then return false end
+    local visited = {count = 0}
+    if focusTextEntry(axApp, true, 0, visited) then return true end
+    visited.count = 0
+    return focusTextEntry(axApp, false, 0, visited)
+end
+
+hs.urlevent.bind("deckbridge-dictation", function(_, params)
+    local request = clean(params.request)
+    if not request:match("^%d+%-%d+%-%d+$") then return end
+    local function finish(ok)
+        local directory = os.getenv("HOME") .. "/.deckbridge/dictation-results"
+        hs.fs.mkdir(os.getenv("HOME") .. "/.deckbridge")
+        hs.fs.mkdir(directory)
+        local temporary = directory .. "/." .. request .. ".tmp"
+        local final = directory .. "/" .. request
+        local handle = io.open(temporary, "w")
+        if not handle then return end
+        handle:write(ok and "ok" or "error")
+        handle:close()
+        os.rename(temporary, final)
+    end
+    local op = clean(params.op)
+    if op == "focus-text-entry" then
+        finish(deckbridgeFocusTextEntry(clean(params.bundle)))
+        return
+    end
+    if op == "tap-mic" then
+        finish(runMicHelper({"tap-mic"}))
+        return
+    end
+    if op == "start-dictation" then
+        finish(startNativeDictation(clean(params.hotkey)))
+        return
+    end
+    if op == "stop-dictation" then
+        finish(stopNativeDictation(clean(params.hotkey)))
+        return
+    end
+    if op == "toggle-dictation" then
+        finish(toggleNativeDictation(clean(params.hotkey)))
+        return
+    end
+    local code = tonumber(params.code)
+    if not code then
+        finish(false)
+        return
+    end
+    local flags = clean(params.flags)
+    if flags == "" then flags = "none" end
+    if op == "tap" then
+        finish(tapMicHelper(code, flags))
+    elseif op == "key-down" then
+        if runMicHelper({"key-down", tostring(code), flags}) then
+            finish(true)
+        else
+            postDictationKey(code, flags, true)
+            finish(true)
+        end
+    elseif op == "key-up" then
+        if runMicHelper({"key-up", tostring(code), flags}) then
+            finish(true)
+        else
+            postDictationKey(code, flags, false)
+            finish(true)
+        end
+    else
+        finish(false)
+    end
+end)

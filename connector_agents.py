@@ -44,6 +44,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -76,6 +77,7 @@ DEFAULT_LOCAL_STATE = "~/.deckbridge/cmux_state.json"
 DEFAULT_DESKTOP_STATE = "~/.deckbridge/desktop_agents.json"
 DEFAULT_T3CODE_STATE = "~/.deckbridge/t3code_agents.json"
 DEFAULT_APPROVALS_STATE = "~/.deckbridge/hermes_approvals.json"
+DEFAULT_ACK_STATE = "~/.deckbridge/agent_acks.json"
 TAILSCALE_AUTH_URL = re.compile(
     r"https://login\.tailscale\.com/a/[A-Za-z0-9]+"
 )
@@ -95,7 +97,6 @@ DEFAULT_MAX_AGE_HOURS = 24.0
 STALE_WORKING_S = 300.0
 LIVENESS_CACHE_S = 5.0
 LOCAL_SESSION_SOURCES = frozenset({"claude-code", "codex-cli", "cursor-agent"})
-T3CODE_HOST_APPS = frozenset({"t3 code", "t3 code (alpha)"})
 #: Hook/desktop/Hermes-CLI records that are the same work as a T3 thread.
 T3_SHADOW_SOURCES = {
     "t3code-cursor": frozenset({"cursor-agent", "cursor-desktop"}),
@@ -251,7 +252,7 @@ SOURCE_BADGE = {
     "herdr": "E",
     "cmux": "M",
     "slack": "L",
-    "gmail": "G",
+    "gmail": "W",
     "google-chrome": "P",
     "discord": "D",
     "notion-calendar": "N",
@@ -298,6 +299,70 @@ def agent_key(agent: dict[str, Any]) -> str:
         # coordinate UUID namespaces, so source is part of identity too.
         return f"{source}:session:{session}"
     return f"{source}:{agent.get('name') or agent.get('cwd') or '?'}"
+
+
+def _ack_stamp(value: Any) -> float:
+    """Round a heartbeat so JSON and SQLite floats compare as the same event."""
+    try:
+        return round(float(value or 0.0), 3)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _parse_ack_map(raw: Any) -> dict[str, tuple[str, float]]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[str, float]] = {}
+    for key, token in raw.items():
+        if not isinstance(key, str) or not key:
+            continue
+        if isinstance(token, (list, tuple)) and len(token) == 2:
+            out[key] = (str(token[0]), _ack_stamp(token[1]))
+    return out
+
+
+def load_acks(
+    path: Path,
+) -> tuple[dict[str, tuple[str, float]], dict[str, tuple[str, float]]]:
+    """Read persisted seen/dismissed tokens, or empty maps on any failure."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, {}
+    if not isinstance(data, dict):
+        return {}, {}
+    return _parse_ack_map(data.get("seen")), _parse_ack_map(data.get("dismissed"))
+
+
+def write_acks(
+    path: Path,
+    seen: dict[str, tuple[str, float]],
+    dismissed: dict[str, tuple[str, float]],
+) -> None:
+    """Atomically persist acknowledgements so a restart cannot resurrect keys."""
+    payload = {
+        "seen": {key: [status, stamp] for key, (status, stamp) in seen.items()},
+        "dismissed": {
+            key: [status, stamp] for key, (status, stamp) in dismissed.items()
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=str(path.parent), text=True,
+    )
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(payload, out)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def _clean_label(text: str) -> str:
@@ -389,18 +454,6 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
             "updated_at": updated_at,
         })
     return agents
-
-
-def is_t3_managed_provider_child(agent: dict[str, Any]) -> bool:
-    """Return whether a hook record is an internal provider owned by T3.
-
-    T3 launches real Claude/Codex/Cursor processes, so global hooks observe
-    them. Their provider session IDs are not T3 thread IDs and cannot navigate
-    the T3 UI; rendering them duplicates the authoritative T3 thread and makes
-    a press merely raise the host app. The owning app is the precise boundary.
-    """
-    app = str(agent.get("app") or "").strip().casefold()
-    return app in T3CODE_HOST_APPS and agent.get("source") in LOCAL_SESSION_SOURCES
 
 
 def workspace_identity(cwd: Any) -> str:
@@ -1143,6 +1196,231 @@ def page_face(page: int, pages: int, hidden: int) -> dict[str, Any]:
     }
 
 
+CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_LOCAL_STATE = Path.home() / "Library/Application Support/Google/Chrome/Local State"
+# Chrome's OS window title is "<page> - Google Chrome - <profile>". A work
+# profile that is also a person is titled "Maanav (blackforestlabs.ai)", so
+# matching the configured profile name as an exact suffix misses every window
+# and the Gmail key opens another Gmail tab on every press.
+_CHROME_PROFILE_MARKER = " - Google Chrome - "
+
+
+def chrome_window_belongs_to_profile(window_name: str, profile_name: str) -> bool:
+    """True when a Chrome OS window title belongs to ``profile_name``."""
+    title = str(window_name or "")
+    profile = str(profile_name or "").strip()
+    if not title or not profile:
+        return False
+    marker = _CHROME_PROFILE_MARKER
+    if marker not in title:
+        return False
+    suffix = title.rsplit(marker, 1)[-1]
+    return suffix == profile or suffix.endswith(" (" + profile + ")")
+
+
+def chrome_titles_refer_to_same_window(chrome_title: str, os_title: str) -> bool:
+    """Pair a Chrome AppleScript window name with its System Events title.
+
+    Chrome truncates the tab title with an ellipsis; System Events keeps the
+    full OS title including the profile suffix. Index-zipping those two lists
+    is what made an already-open Gmail tab look missing.
+    """
+    chrome = str(chrome_title or "")
+    os_name = str(os_title or "")
+    if not chrome or not os_name:
+        return False
+    if os_name.startswith(chrome):
+        return True
+    if "…" in chrome:
+        head, tail = chrome.split("…", 1)
+        return os_name.startswith(head) and tail in os_name
+    return False
+
+
+def chrome_tab_matches_url(tab_url: str, target: str) -> bool:
+    """True when an open tab is the destination, including Gmail hash routes."""
+    tab = str(tab_url or "").strip()
+    want = str(target or "").strip()
+    if not tab or not want:
+        return False
+    if tab.startswith(want):
+        return True
+    tab_base = tab.split("#", 1)[0].rstrip("/")
+    want_base = want.split("#", 1)[0].rstrip("/")
+    if tab_base == want_base or tab_base.startswith(want_base + "/"):
+        return True
+    if "mail.google.com/mail" in want and "mail.google.com/mail" in tab:
+        return True
+    return False
+
+
+_CHROME_RAISE_SCRIPT = r'''
+on run argv
+    set profileName to item 1 of argv
+    set profileSuffix to " - Google Chrome - " & profileName
+    set profileParen to " (" & profileName & ")"
+    tell application "System Events"
+        if exists process "Google Chrome" then
+            tell process "Google Chrome"
+                repeat with windowRef in windows
+                    try
+                        set windowName to name of windowRef as text
+                        if windowName ends with profileSuffix or windowName ends with profileParen then
+                            perform action "AXRaise" of windowRef
+                            set frontmost to true
+                            return "focused"
+                        end if
+                    end try
+                end repeat
+            end tell
+        end if
+    end tell
+    return "missing"
+end run
+'''
+_CHROME_TAB_SCRIPT = r'''
+on run argv
+    set profileName to item 1 of argv
+    set targetUrl to item 2 of argv
+    set profileSuffix to " - Google Chrome - " & profileName
+    set profileParen to " (" & profileName & ")"
+    tell application "System Events"
+        if not (exists process "Google Chrome") then return "missing"
+        tell process "Google Chrome"
+            set osNames to name of windows
+        end tell
+    end tell
+    tell application "Google Chrome"
+        if (count of windows) is 0 then return "missing"
+        set profileId to 0
+        set fallbackWinId to 0
+        set fallbackTabIndex to 0
+        repeat with w in windows
+            set chromeTitle to name of w as text
+            set isProfile to false
+            repeat with osNameRef in osNames
+                set osName to osNameRef as text
+                if osName ends with profileSuffix or osName ends with profileParen then
+                    if osName starts with chromeTitle then
+                        set isProfile to true
+                    else if chromeTitle contains "…" then
+                        set AppleScript's text item delimiters to "…"
+                        set parts to text items of chromeTitle
+                        set AppleScript's text item delimiters to ""
+                        if (count of parts) is 2 then
+                            if osName starts with (item 1 of parts) and osName contains (item 2 of parts) then
+                                set isProfile to true
+                            end if
+                        end if
+                    end if
+                end if
+                if isProfile then exit repeat
+            end repeat
+            if isProfile and profileId is 0 then set profileId to id of w
+            set tabIndex to 0
+            repeat with t in tabs of w
+                set tabIndex to tabIndex + 1
+                try
+                    set tabUrl to URL of t as text
+                    set matched to false
+                    if tabUrl starts with targetUrl then set matched to true
+                    if targetUrl contains "mail.google.com" and tabUrl contains "mail.google.com/mail" then set matched to true
+                    if matched then
+                        if isProfile then
+                            set active tab index of w to tabIndex
+                            set index of w to 1
+                            activate
+                            return "focused-tab"
+                        end if
+                        if fallbackWinId is 0 then
+                            set fallbackWinId to id of w
+                            set fallbackTabIndex to tabIndex
+                        end if
+                    end if
+                end try
+            end repeat
+        end repeat
+        if fallbackWinId is not 0 then
+            set active tab index of window id fallbackWinId to fallbackTabIndex
+            set index of window id fallbackWinId to 1
+            activate
+            return "focused-tab"
+        end if
+        if profileId is 0 then return "missing"
+        tell window id profileId to make new tab with properties {URL:targetUrl}
+        set index of window id profileId to 1
+        activate
+        return "new-tab"
+    end tell
+end run
+'''
+
+
+def lookup_chrome_profile_name(profile: str) -> str:
+    """Return Chrome's visible profile name for a profile directory.
+
+    Window titles use the display name, not ``Default`` / ``Profile 1``. Reading
+    Local State keeps Gmail's work-window match working without duplicating
+    that name in config.
+    """
+    directory = str(profile or "").strip()
+    if not directory:
+        return ""
+    try:
+        payload = json.loads(CHROME_LOCAL_STATE.read_text(encoding="utf-8"))
+        cache = payload.get("profile", {}).get("info_cache", {})
+        info = cache.get(directory) if isinstance(cache, dict) else None
+        if isinstance(info, dict):
+            return str(info.get("name") or "").strip()
+    except (OSError, ValueError, TypeError):
+        return ""
+    return ""
+
+
+def raise_chrome_profile_window(profile_name: str) -> bool:
+    """Raise an existing Chrome window for ``profile_name``, if one is open."""
+    name = str(profile_name or "").strip()
+    if not name:
+        return False
+    try:
+        focused = subprocess.run(
+            ["/usr/bin/osascript", "-e", _CHROME_RAISE_SCRIPT, name],
+            check=False, capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Chrome profile focus failed for %s: %s", name, exc)
+        return False
+    if focused.returncode == 0 and focused.stdout.strip() == "focused":
+        log.info("focused Chrome profile window: %s", name)
+        return True
+    return False
+
+
+def open_or_focus_chrome_tab(profile_name: str, url: str) -> bool:
+    """Focus a matching tab in this Chrome profile, or open one if none exist.
+
+    Searches every window of the profile. Opening a new Gmail tab is reserved
+    for the case where that profile has windows but no Gmail at all.
+    """
+    name = str(profile_name or "").strip()
+    target = str(url or "").strip()
+    if not name or not target:
+        return False
+    try:
+        result = subprocess.run(
+            ["/usr/bin/osascript", "-e", _CHROME_TAB_SCRIPT, name, target],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Chrome tab open failed for %s: %s", target, exc)
+        return False
+    status = (result.stdout or "").strip()
+    if result.returncode == 0 and status in ("focused-tab", "new-tab"):
+        log.info("Chrome tab %s for %s", status, target)
+        return True
+    return False
+
+
 class AgentConnector:
     """Poll both agent feeds and paint one inclusive deckd key range."""
 
@@ -1164,6 +1442,7 @@ class AgentConnector:
         hermes_health: str | os.PathLike[str] | None = None,
         remote_herdr_resolver: Any | None = None,
         badge_provider: Any | None = None,
+        ack_state: str | os.PathLike[str] | None = None,
     ) -> None:
         first, last = int(claim[0]), int(claim[1])
         if first < 0 or first > last:
@@ -1202,6 +1481,13 @@ class AgentConnector:
             if remote_herdr_resolver is not None else HerdrSshPaneResolver()
         )
         self.badge_provider = badge_provider if badge_provider is not None else AppBadgeProvider()
+        # Tests construct connectors against temporary feeds and must not write
+        # acknowledgements into the live ~/.deckbridge directory.  The CLI
+        # always passes the configured path explicitly.
+        self.ack_state = (
+            Path(os.path.expanduser(os.fspath(ack_state)))
+            if ack_state is not None else None
+        )
 
         self.ws: Any = None
         # Constructed by tests and config loaders before an event loop exists.
@@ -1222,9 +1508,12 @@ class AgentConnector:
         self.page = 0
         # agent_key -> the status that was acknowledged.  Storing the status,
         # not just a flag, is what makes the acknowledgement expire when the
-        # agent moves on.
-        self._seen: dict[str, tuple[str, float]] = {}
-        self._dismissed: dict[str, tuple[str, float]] = {}
+        # agent moves on.  Loaded from disk so a LaunchAgent recycle cannot
+        # resurrect a thread the operator already put away.
+        if self.ack_state is not None:
+            self._seen, self._dismissed = load_acks(self.ack_state)
+        else:
+            self._seen, self._dismissed = {}, {}
         self._down: dict[int, float] = {}
         self._last_payload: dict[int, dict[str, Any]] | None = None
         self.liveness_probe: Any = LocalLivenessProbe()
@@ -1264,10 +1553,11 @@ class AgentConnector:
                     # arbitrary transport errors can never turn into links.
                     "url": auth_url.group(0) if auth_url is not None else "",
                 })
-        local = [
-            agent for agent in read_agents(self.local_state, source_default="cmux")
-            if not is_t3_managed_provider_child(agent)
-        ]
+        # T3 owns provider subprocesses, but its thread feed is not guaranteed
+        # to contain their parent (for example during an environment switch).
+        # Keep the hook record until collapse_t3_shadows can prove an exact
+        # same-provider workspace thread is authoritative.
+        local = read_agents(self.local_state, source_default="cmux")
         agents += reconcile_local_liveness(local, self.liveness_probe)
         # Native desktop conversations do not have a child CLI PID to probe.
         # Their watcher renews only while an Accessibility-visible app window
@@ -1282,16 +1572,25 @@ class AgentConnector:
             for agent in agents:
                 if manual_view_matches(agent, view, agents):
                     self.mark_seen(agent)
-        # Acknowledgements are forgotten for agents that have left the feeds
-        # entirely, or the dicts grow without bound in a long-running session.
-        # This is done BEFORE the dismissed filter, because a dismissed agent is
-        # deliberately absent from the returned list but very much still live.
-        live = {agent_key(a) for a in agents}
+        # Forget acknowledgements whose heartbeat is older than the board's
+        # own age cutoff.  Do not forget them merely because the agent left
+        # this poll: Hermes ranking can drop a finished thread for one cycle
+        # and put it back with the same heartbeat, which used to resurrect
+        # every long-pressed Discord key.
+        cutoff = current - max(0.0, self.max_age_hours) * 3600.0
+        expired = False
         for store in (self._seen, self._dismissed):
-            for key in [k for k in store if k not in live]:
+            for key in [k for k, token in store.items()
+                        if token[1] and token[1] < cutoff]:
                 del store[key]
+                expired = True
+        if expired:
+            self._persist_acks()
         # A long-pressed agent leaves the board until it does something new.
-        return [a for a in agents if not self._is_dismissed(a)]
+        # Viewing a Discord completion is not a dismissal: it settles to the
+        # quiet done face so the thread stays a jump target. Overflow is the
+        # pager's job, not an implicit drop of anything the operator opened.
+        return [agent for agent in agents if not self._is_dismissed(agent)]
 
     def build_faces(self, agents: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
         """Map every claimed key to a face, pinning agents to their slots."""
@@ -1382,14 +1681,35 @@ class AgentConnector:
         or another update with the same status -- moves ``updated_at``, and any
         event means there is something the operator has not seen.
         """
-        return (str(agent.get("status", "")), float(agent.get("updated_at") or 0.0))
+        return (str(agent.get("status", "")), _ack_stamp(agent.get("updated_at")))
+
+    def _ack_covers(
+        self, stored: tuple[str, float] | None, agent: dict[str, Any],
+    ) -> bool:
+        """True when ``stored`` still accounts for the agent's current event.
+
+        A later, *less* urgent status on the same heartbeat is the same turn
+        decaying (Hermes clearing its in-progress description), not a new
+        result.  A more urgent status, or any newer heartbeat, is new work.
+        """
+        if stored is None:
+            return False
+        current = self._ack_token(agent)
+        if stored[1] != current[1]:
+            return False
+        return STATUS_ORDER.get(current[0], 0) <= STATUS_ORDER.get(stored[0], 0)
 
     def _is_seen(self, agent: dict[str, Any]) -> bool:
         """Has this agent been acknowledged as it stands RIGHT NOW?"""
-        return self._seen.get(agent_key(agent)) == self._ack_token(agent)
+        return self._ack_covers(self._seen.get(agent_key(agent)), agent)
 
     def mark_seen(self, agent: dict[str, Any]) -> None:
-        self._seen[agent_key(agent)] = self._ack_token(agent)
+        key = agent_key(agent)
+        existing = self._seen.get(key)
+        if existing is not None and self._ack_covers(existing, agent):
+            return
+        self._seen[key] = self._ack_token(agent)
+        self._persist_acks()
 
     def dismiss(self, agent: dict[str, Any]) -> None:
         """Drop an agent from the board until it does something new.
@@ -1399,11 +1719,22 @@ class AgentConnector:
         and clutter is what pushes live agents onto page 2.
         """
         key = agent_key(agent)
-        self._dismissed[key] = self._ack_token(agent)
+        existing = self._dismissed.get(key)
+        if existing is None or not self._ack_covers(existing, agent):
+            self._dismissed[key] = self._ack_token(agent)
         self._slots.remove_and_compact(key)
+        self._persist_acks()
 
     def _is_dismissed(self, agent: dict[str, Any]) -> bool:
-        return self._dismissed.get(agent_key(agent)) == self._ack_token(agent)
+        return self._ack_covers(self._dismissed.get(agent_key(agent)), agent)
+
+    def _persist_acks(self) -> None:
+        if self.ack_state is None:
+            return
+        try:
+            write_acks(self.ack_state, self._seen, self._dismissed)
+        except OSError:
+            log.warning("could not persist agent acknowledgements", exc_info=True)
 
     # -- press ------------------------------------------------------------
     def launch(self, app: dict[str, str]) -> None:
@@ -1428,52 +1759,34 @@ class AgentConnector:
         url = str(app.get("url") or "").strip()
         profile = str(app.get("profile") or "").strip()
         profile_name = str(app.get("profile_name") or "").strip()
-        # URL buttons use argv, not a shell template. Gmail's explicit Chrome
-        # profile is what prevents a work shortcut from silently landing in
-        # the personal inbox. A custom launch_cmd remains an injectable test
-        # and operator override for every button.
-        if (self.launch_cmd == DEFAULT_LAUNCH_CMD and profile
-                and profile_name and not url):
-            # Chrome is one process for every profile, so activating the app or
-            # sending Cmd+` cannot identify which of several windows is the
-            # personal one. Window titles expose the visible profile suffix;
-            # raise that exact window without creating a disposable tab.
-            focus_script = r'''
-on run argv
-    set profileName to item 1 of argv
-    set profileSuffix to " - Google Chrome - " & profileName
-    tell application "System Events"
-        if exists process "Google Chrome" then
-            tell process "Google Chrome"
-                repeat with windowRef in windows
-                    try
-                        if (name of windowRef as text) ends with profileSuffix then
-                            perform action "AXRaise" of windowRef
-                            set frontmost to true
-                            return "focused"
-                        end if
-                    end try
-                end repeat
-            end tell
-        end if
-    end tell
-    return "missing"
-end run
-'''
-            try:
-                focused = subprocess.run(
-                    ["/usr/bin/osascript", "-e", focus_script, profile_name],
-                    check=False, capture_output=True, text=True, timeout=3,
-                )
-                if focused.returncode == 0 and focused.stdout.strip() == "focused":
-                    log.info("focused Chrome profile window: %s", profile_name)
+        # Chrome is one process for every profile. Activating the app or
+        # sending the binary a URL often creates another window of that
+        # profile. Raise the existing work/personal window first; only spawn
+        # Chrome when that profile has no window at all.
+        if self.launch_cmd == DEFAULT_LAUNCH_CMD and profile:
+            window_name = (
+                profile_name or lookup_chrome_profile_name(profile) or profile
+            )
+            if url:
+                if open_or_focus_chrome_tab(window_name, url):
                     return
-            except (OSError, subprocess.SubprocessError) as exc:
-                log.warning("Chrome profile focus failed for %s: %s", profile_name, exc)
+                command_argv = [
+                    CHROME_BIN, f"--profile-directory={profile}", url,
+                ]
+                log.info("launch URL: %s", command_argv)
+                try:
+                    subprocess.run(
+                        command_argv, check=False, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=15,
+                    )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    log.warning("launch URL failed for %s: %s", app.get("label"), exc)
+                return
+            if raise_chrome_profile_window(window_name):
+                return
             command_argv = [
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                f"--profile-directory={profile}", "--new-window",
-                "chrome://newtab/",
+                CHROME_BIN, f"--profile-directory={profile}",
+                "--new-window", "chrome://newtab/",
             ]
             log.info("launch Chrome profile window: %s", command_argv)
             try:
@@ -1482,20 +1795,10 @@ end run
                     stderr=subprocess.DEVNULL, timeout=15,
                 )
             except (OSError, subprocess.SubprocessError) as exc:
-                log.warning("Chrome profile launch failed for %s: %s", profile_name, exc)
+                log.warning("Chrome profile launch failed for %s: %s", window_name, exc)
             return
         if self.launch_cmd == DEFAULT_LAUNCH_CMD and url:
-            if profile:
-                command_argv = [
-                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                    # With no --new-window switch Chrome's singleton forwards
-                    # the URL into a new tab of the existing profile window.
-                    # If that profile has no window, Chrome naturally creates
-                    # one, which is the only useful fallback.
-                    f"--profile-directory={profile}", url,
-                ]
-            else:
-                command_argv = ["/usr/bin/open", url]
+            command_argv = ["/usr/bin/open", url]
             log.info("launch URL: %s", command_argv)
             try:
                 subprocess.run(
@@ -1720,6 +2023,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-state", default=DEFAULT_LOCAL_STATE)
     parser.add_argument("--desktop-state", default=DEFAULT_DESKTOP_STATE)
     parser.add_argument("--t3code-state", default=DEFAULT_T3CODE_STATE)
+    parser.add_argument("--ack-state", default=DEFAULT_ACK_STATE)
     parser.add_argument("--focus-cmd", default=DEFAULT_FOCUS_CMD)
     parser.add_argument("--apps-config", default=DEFAULT_APPS_CONFIG)
     parser.add_argument("--launch-cmd", default=DEFAULT_LAUNCH_CMD)
@@ -1745,6 +2049,7 @@ def main(argv: list[str] | None = None) -> int:
         local_state=args.local_state,
         desktop_state=args.desktop_state,
         t3code_state=args.t3code_state,
+        ack_state=args.ack_state,
         focus_cmd=args.focus_cmd,
         poll_interval=args.poll_interval,
         max_age_hours=args.max_age_hours,

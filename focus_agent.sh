@@ -42,7 +42,7 @@ SCRIPT_NAME=${0##*/}
 # Bumped whenever focus resolution changes, so --diagnose and a failed press
 # both say which checkout actually ran. A stale extract alongside a fresh one
 # produces symptoms identical to a logic bug.
-BUILD_STAMP=2026-08-19.t3code-title-click
+BUILD_STAMP=2026-08-19.launcher-new-if-focused
 DRY_RUN=0
 DIAGNOSE=0
 TTY_HINT=
@@ -79,7 +79,9 @@ SOURCE: claude-code | codex-cli | cursor-agent | cmux | hermes-discord | hermes-
        way to reach it. Never launched: an agent key means "go to that
        session", so a quit app means the session is gone.
 --launch  open an application, launching it when it is not running. The
-       explicit app keys, where launching IS the intent.
+       explicit app keys, where launching IS the intent. A second press
+       while T3 Code, Claude, or ChatGPT is already frontmost starts a
+       new thread instead of merely raising the same window.
 EOF
 }
 
@@ -1872,18 +1874,91 @@ focus_t3code() {
 }
 
 launch_t3code_thread() {
-  command -v open >/dev/null 2>&1 || return 1
-  open -a "T3 Code (Alpha)" >/dev/null 2>&1 || return 1
-  # The app may still be constructing its renderer after a cold launch.
-  local polls=0
-  while [ "$polls" -lt 30 ]; do
-    if deckbridge_control --helper-press-button com.t3tools.t3code "New thread" >/dev/null 2>&1; then
+  launch_app "T3 Code (Alpha)"
+}
+
+# Instant frontmost check for launcher keys. app_is_frontmost waits up to a
+# second for activate to stick; a launcher press must not stall when another
+# app is in front.
+app_is_currently_frontmost() {
+  local app=$1 bundle front
+  bundle=$(app_bundle_id "$app") || return 1
+  front=$(deckbridge_control --helper-frontmost 2>/dev/null || true)
+  case "|$front|" in
+    *"|$bundle|"*) return 0 ;;
+  esac
+  return 1
+}
+
+start_new_desktop_session() {
+  local app=$1 polls=0
+  case "$app" in
+    "T3 Code (Alpha)")
+      while [ "$polls" -lt 10 ]; do
+        if deckbridge_control --helper-press-button com.t3tools.t3code "New thread" >/dev/null 2>&1; then
+          return 0
+        fi
+        polls=$((polls + 1))
+        sleep 0.1
+      done
+      error "T3 Code is focused but its New thread control was unavailable"
+      return 1
+      ;;
+    Claude)
+      open "claude://claude.ai/new" >/dev/null 2>&1 && return 0
+      error "could not open a new Claude chat"
+      return 1
+      ;;
+    ChatGPT)
+      open "codex://threads/new" >/dev/null 2>&1 && return 0
+      error "could not open a new ChatGPT thread"
+      return 1
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+new_session_dry_run() {
+  case "$1" in
+    "T3 Code (Alpha)") printf 'WOULD RUN: press New thread in T3 Code (Alpha)\n' ;;
+    Claude) printf 'WOULD RUN: open claude://claude.ai/new\n' ;;
+    ChatGPT) printf 'WOULD RUN: open codex://threads/new\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Open an application by name, LAUNCHING it if it is not running.
+#
+# This is the one place in the script where launching is correct, and the
+# distinction is intent, not capability. Pressing an explicit "Claude" key says
+# "I want Claude"; there is no session to be wrong about. Pressing an AGENT key
+# says "take me to that running session", and launching a blank app there is a
+# lie about state -- which is exactly the phantom-window bug. Two code paths,
+# opposite rules, on purpose.
+#
+# A second press while T3/Claude/ChatGPT is already the frontmost app starts a
+# new thread. The first press only raises the app, so switching to it never
+# discards the conversation you were looking at.
+#
+# `open -a` is used rather than AppleScript `activate` because it reports a
+# missing application as a nonzero exit instead of silently doing nothing.
+launch_app() {
+  local app=$1
+  [ -n "$app" ] || { error "--launch requires an application name"; return 2; }
+  if [ "$DRY_RUN" -eq 1 ]; then
+    if app_is_currently_frontmost "$app" && new_session_dry_run "$app"; then
       return 0
     fi
-    polls=$((polls + 1))
-    sleep 0.1
-  done
-  error "T3 Code opened but its New thread control was unavailable"
+    printf 'WOULD RUN: open -a %s\n' "$app"
+    return 0
+  fi
+  command -v open >/dev/null 2>&1 || { error "open is unavailable (not macOS?)"; return 1; }
+  if app_is_currently_frontmost "$app"; then
+    start_new_desktop_session "$app"
+    return $?
+  fi
+  open -a "$app" 2>/dev/null && return 0
+  error "could not open $app (no such application?)"
   return 1
 }
 
@@ -2322,29 +2397,6 @@ open_discord_url() {
   return $?
 }
 
-# Open an application by name, LAUNCHING it if it is not running.
-#
-# This is the one place in the script where launching is correct, and the
-# distinction is intent, not capability. Pressing an explicit "Claude" key says
-# "I want Claude"; there is no session to be wrong about. Pressing an AGENT key
-# says "take me to that running session", and launching a blank app there is a
-# lie about state -- which is exactly the phantom-window bug. Two code paths,
-# opposite rules, on purpose.
-#
-# `open -a` is used rather than AppleScript `activate` because it reports a
-# missing application as a nonzero exit instead of silently doing nothing.
-launch_app() {
-  local app=$1
-  [ -n "$app" ] || { error "--launch requires an application name"; return 2; }
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf 'WOULD RUN: open -a %s\n' "$app"
-    return 0
-  fi
-  command -v open >/dev/null 2>&1 || { error "open is unavailable (not macOS?)"; return 1; }
-  open -a "$app" 2>/dev/null && return 0
-  error "could not open $app (no such application?)"
-  return 1
-}
 
 main() {
   parse_args "$@" || return $?

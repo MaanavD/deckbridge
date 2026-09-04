@@ -29,6 +29,7 @@ from connection_runtime import (
     RetryPolicy,
     retry_delay_for_error,
 )
+from hermes_agents_probe import drop_liveness_probes
 
 LOG = logging.getLogger("hermes_agents_watcher")
 DEFAULT_DB = "/home/hermes/.hermes/state.db"
@@ -141,7 +142,7 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"probe returned invalid JSON: {exc}") from exc
     if not isinstance(document, dict) or not isinstance(document.get("agents"), list):
         raise ValueError("probe JSON must be an object with an agents list")
-    return annotate_ssh_host(document, args.ssh)
+    return drop_liveness_probes(annotate_ssh_host(document, args.ssh))
 
 
 def write_atomic(path: str | Path, document: dict[str, Any]) -> None:
@@ -173,7 +174,7 @@ def poll_once(
 ) -> dict[str, Any] | None:
     """Publish one successful poll; return None while preserving old state on failure."""
     try:
-        document = run_probe(args)
+        document = drop_liveness_probes(run_probe(args))
         write_atomic(args.out, document)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         if reporter is not None:

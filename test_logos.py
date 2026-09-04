@@ -80,6 +80,22 @@ class TestLogoFiles(unittest.TestCase):
                     head = handle.read().split(">")[0]
                 self.assertIn("fill=", head)
 
+    def test_gmail_mark_is_upside_down_work_w(self):
+        """The Gmail M inverted is the Work W, so the key is visibly work mail."""
+        path = logos.logo_path("gmail")
+        with open(path, encoding="utf-8") as handle:
+            svg = handle.read()
+        self.assertIn("rotate(180", svg)
+        self.assertEqual(logos.badge_letter("gmail"), "W")
+
+    def test_personal_chrome_mark_is_the_site_lotus(self):
+        """The personal Chrome key wears the lotus from maanavdalal.com."""
+        path = logos.logo_path("google-chrome")
+        with open(path, encoding="utf-8") as handle:
+            svg = handle.read()
+        self.assertIn("Lotus", svg)
+        self.assertIn("245.83", svg)
+
     def test_unknown_source_has_no_path_and_no_letter(self):
         self.assertIsNone(logos.logo_path("not-a-real-source"))
         self.assertEqual(logos.badge_letter("not-a-real-source"), "")

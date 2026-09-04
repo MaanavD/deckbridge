@@ -482,8 +482,8 @@ def test_merges_native_desktop_surfaces() -> None:
               (Path(tmp) / "focus").read_text(encoding="utf-8").strip() == "Claude|chat-1")
 
 
-def test_t3_managed_provider_children_are_not_separate_buttons() -> None:
-    """T3's Claude/Codex subprocess hooks are implementation detail, not tabs."""
+def test_t3_managed_provider_children_follow_authoritative_thread_coverage() -> None:
+    """Suppress a provider child only when T3 publishes its owning thread."""
     now = time.time()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -491,24 +491,33 @@ def test_t3_managed_provider_children_are_not_separate_buttons() -> None:
         write(local, [
             {"name": "cx-Test2", "status": "done", "source": "codex-cli",
              "session_id": "provider-session", "app": "T3 Code (Alpha)",
+             "cwd": "/Users/maanav/Downloads/test2",
              "updated_at": now},
             {"name": "cx-Generate", "status": "done", "source": "codex-cli",
              "session_id": "title-worker", "app": "T3 Code (Alpha)",
+             "cwd": "/Users/maanav/Downloads/test2",
+             "updated_at": now},
+            {"name": "cc-Unlisted", "status": "working", "source": "claude-code",
+             "session_id": "claude-provider", "app": "T3 Code (Alpha)",
+             "cwd": "/Users/maanav/Downloads/unlisted", "agent_pid": os.getpid(),
              "updated_at": now},
         ])
         write(t3, [{
             "name": "Test2", "status": "done", "source": "t3code-codex",
             "session_id": "thread-1", "thread_id": "thread-1",
+            "cwd": "/Users/maanav/Downloads/test2",
             "app": "T3 Code (Alpha)", "updated_at": now,
         }])
         connector = AgentConnector(
             hermes_state=root / "none.json", local_state=local,
             desktop_state=root / "desktop.json", t3code_state=t3,
         )
+        # This test exercises T3 feed coverage, not the host process table.
+        connector.liveness_probe = lambda _agent: None
         found = connector.collect(now)
         check("T3 provider subprocesses collapse into their authoritative thread",
               [(a["source"], a["name"]) for a in found]
-              == [("t3code-codex", "Test2")], str(found))
+              == [("claude-code", "Unlisted"), ("t3code-codex", "Test2")], str(found))
 
 
 def test_workspace_identity_collapses_cursor_project_mirrors() -> None:
@@ -808,9 +817,12 @@ def test_manual_surface_view_acknowledges_the_current_event() -> None:
             hermes_state=hermes, local_state=root / "none.json",
             desktop_state=desktop,
         )
-        face = c.build_faces(c.collect(now))[0]
-        check("a manually selected Discord thread becomes viewed",
-              face["seen"] is True and face["sublabel"] == "done", str(face))
+        agents = c.collect(now)
+        face = c.build_faces(agents)[0]
+        check("a manually selected Discord completion settles to done",
+              bool(agents) and face.get("seen") is True
+              and face.get("sublabel") == "done",
+              str({"names": [a["name"] for a in agents], "face": face}))
 
         # The acknowledgement covers this completion only. A later result in
         # the same selected thread must become visible if the user has left it.
@@ -1063,6 +1075,137 @@ def test_a_dismissed_agent_returns_on_a_repeated_status() -> None:
         publish("done", now + 5)
         check("a fresh result brings a dismissed agent back",
               [a["name"] for a in c.collect(now + 5)] == ["proj"])
+
+
+def test_a_dismissed_thread_stays_gone_when_it_briefly_leaves_the_feed() -> None:
+    """Probe ranking churn must not resurrect a long-pressed Hermes thread.
+
+    The remote probe keeps only the top sessions. A finished Discord thread
+    can drop out of that window and come back on the next poll with the same
+    heartbeat. Forgetting the dismissal in that gap is why Open draft kept
+    returning after a long-press with no new work.
+    """
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        hermes = Path(tmp) / "hermes.json"
+        thread = {
+            "name": "Open draft", "status": "done",
+            "source": "hermes-discord", "thread_id": "1539333574875029594",
+            "updated_at": now,
+        }
+        write(hermes, [thread])
+        c = AgentConnector(claim=(0, 9), hermes_state=hermes,
+                           local_state=Path(tmp) / "none.json")
+        c.build_faces(c.collect(now))
+        c.dismiss(c._agent_keys[0])
+        check("dismissed", c.collect(now) == [])
+
+        write(hermes, [])
+        check("absent from this poll", c.collect(now) == [])
+
+        write(hermes, [thread])
+        check("the same heartbeat does not return after a ranking gap",
+              c.collect(now) == [])
+
+
+def test_a_working_turn_decaying_to_done_stays_acknowledged() -> None:
+    """Hermes clearing its heartbeat description is not a new result.
+
+    The probe classifies a live description as working and an empty one as
+    done, often with the same last_activity_at. A tap or long-press during
+    that turn must cover the decay, or the key shouts NEEDS YOU again the
+    moment the turn ends.
+    """
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "local.json"
+        write(local, [
+            {"name": "sample api", "status": "working", "cwd": "/w",
+             "source": "codex-cli", "updated_at": now},
+        ])
+        c = AgentConnector(claim=(0, 9), hermes_state=Path(tmp) / "none.json",
+                           local_state=local)
+        c.build_faces(c.collect(now))
+        c.mark_seen(c._agent_keys[0])
+        write(local, [
+            {"name": "sample api", "status": "done", "cwd": "/w",
+             "source": "codex-cli", "updated_at": now},
+        ])
+        face = c.build_faces(c.collect(now))[0]
+        check("the same heartbeat decaying to done stays seen",
+              face["seen"] is True and face["sublabel"] == "done", str(face))
+
+
+def test_viewing_a_finished_hermes_thread_settles_to_done() -> None:
+    """A Discord result you opened is still a jump target, just quieter.
+
+    Auto-dropping viewed Discord completions freed a key under overflow, but
+    looking at a result is not dismissing it. Long-press is how clutter
+    leaves; a tap should land on the quiet done face like every other source.
+    """
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        hermes = Path(tmp) / "hermes.json"
+        write(hermes, [{
+            "name": "Open draft", "status": "done",
+            "source": "hermes-discord", "thread_id": "1539333574875029594",
+            "updated_at": now,
+        }])
+        c = AgentConnector(claim=(0, 9), hermes_state=hermes,
+                           local_state=Path(tmp) / "none.json")
+        c.focus = lambda agent: None  # type: ignore[method-assign]
+        c._send = _noop_send  # type: ignore[method-assign]
+        c.build_faces(c.collect(now))
+
+        async def tap() -> None:
+            await c._handle({"type": "press", "index": 0})
+            c._down[0] = time.monotonic() - 0.05
+            await c._handle({"type": "release", "index": 0})
+
+        asyncio.run(tap())
+        agents = c.collect(now)
+        face = c.build_faces(agents)[0]
+        check("a tap on a Discord completion stays as quiet done",
+              bool(agents) and face.get("seen") is True
+              and face.get("sublabel") == "done" and 0 in c._agent_keys,
+              str({"names": [a["name"] for a in agents], "face": face}))
+
+        write(hermes, [{
+            "name": "Open draft", "status": "done",
+            "source": "hermes-discord", "thread_id": "1539333574875029594",
+            "updated_at": now + 9,
+        }])
+        next_face = c.build_faces(c.collect(now + 9))[0]
+        check("new work on that thread still announces itself",
+              next_face["seen"] is False
+              and next_face["sublabel"] == "NEEDS YOU", str(next_face))
+
+
+def test_dismissals_survive_a_connector_restart() -> None:
+    """Long-press must outlive a LaunchAgent recycle."""
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        hermes = Path(tmp) / "hermes.json"
+        acks = Path(tmp) / "acks.json"
+        write(hermes, [{
+            "name": "Open draft", "status": "done",
+            "source": "hermes-discord", "thread_id": "1539333574875029594",
+            "updated_at": now,
+        }])
+        first = AgentConnector(
+            claim=(0, 9), hermes_state=hermes,
+            local_state=Path(tmp) / "none.json", ack_state=acks,
+        )
+        first.build_faces(first.collect(now))
+        first.dismiss(first._agent_keys[0])
+        check("dismissed before restart", first.collect(now) == [])
+
+        second = AgentConnector(
+            claim=(0, 9), hermes_state=hermes,
+            local_state=Path(tmp) / "none.json", ack_state=acks,
+        )
+        check("the dismissal is still in force after a new process",
+              second.collect(now) == [])
 
 
 def test_missing_and_corrupt_files() -> None:
@@ -1345,20 +1488,89 @@ def test_launcher_press_launches_the_app() -> None:
 
 
 def test_gmail_reuses_the_work_profile_window() -> None:
-    """The fixed Gmail key opens a tab, not another Chrome window."""
+    """The Gmail key focuses an existing work Gmail tab, and only opens one if none exist."""
+    check("Chrome titles with a parenthetical account still belong to that profile",
+          connector_module.chrome_window_belongs_to_profile(
+              "Inbox - Google Chrome - Maanav (blackforestlabs.ai)",
+              "blackforestlabs.ai"))
+    check("a personal window is not treated as the work profile",
+          not connector_module.chrome_window_belongs_to_profile(
+              "Inbox - Google Chrome - Maanav", "blackforestlabs.ai"))
+    check("an exact profile suffix still matches",
+          connector_module.chrome_window_belongs_to_profile(
+              "Inbox - Google Chrome - blackforestlabs.ai",
+              "blackforestlabs.ai"))
+    check("a truncated Chrome title still pairs with the OS window",
+          connector_module.chrome_titles_refer_to_same_window(
+              "BFL Demo Day - Aug 20 - maanav…bs.ai - Black Forest Labs Mail",
+              "BFL Demo Day - Aug 20 - maanav@blackforestlabs.ai - Black Forest Labs Mail - Google Chrome - Maanav (blackforestlabs.ai)"))
+    check("Gmail inbox and chat hashes count as already open",
+          connector_module.chrome_tab_matches_url(
+              "https://mail.google.com/mail/u/0/#inbox",
+              "https://mail.google.com/mail/u/0/")
+          and connector_module.chrome_tab_matches_url(
+              "https://mail.google.com/mail/u/0/#chat/space/AAQAKYQLaJ4",
+              "https://mail.google.com/mail/u/0/"))
+    check("the tab script searches Chrome windows by title, not by list index",
+          "repeat with w in windows" in connector_module._CHROME_TAB_SCRIPT
+          and "item i of windowNames" not in connector_module._CHROME_TAB_SCRIPT)
+    check("an unmatched-profile Gmail tab is still reused instead of duplicated",
+          "fallbackWinId" in connector_module._CHROME_TAB_SCRIPT)
+    check("the tab script only creates a tab after that search",
+          connector_module._CHROME_TAB_SCRIPT.find("make new tab")
+          > connector_module._CHROME_TAB_SCRIPT.find("focused-tab"))
+
     c = AgentConnector()
-    calls = []
+    gmail = {
+        "label": "Gmail", "source": "gmail", "bundle": "Google Chrome",
+        "url": "https://mail.google.com/mail/u/0/",
+        "profile": "Default", "profile_name": "blackforestlabs.ai",
+    }
     original_run = connector_module.subprocess.run
-    connector_module.subprocess.run = lambda argv, **kwargs: calls.append(argv)
+
+    class Result:
+        def __init__(self, stdout="", returncode=0):
+            self.stdout = stdout
+            self.returncode = returncode
+
+    focused_calls = []
+    connector_module.subprocess.run = lambda argv, **kwargs: (
+        focused_calls.append(list(argv)) or Result("focused-tab\n"))
     try:
-        c.launch(DEFAULT_SHORTCUTS[1])
+        c.launch(gmail)
     finally:
         connector_module.subprocess.run = original_run
-    argv = calls[0] if calls else []
-    check("Gmail targets Chrome's Default work profile",
-          "--profile-directory=Default" in argv, repr(argv))
-    check("Gmail opens a tab instead of forcing a new window",
-          "--new-window" not in argv, repr(argv))
+    check("existing Gmail is focused in one Chrome query",
+          len(focused_calls) == 1
+          and focused_calls[0][0] == "/usr/bin/osascript"
+          and "blackforestlabs.ai" in focused_calls[0]
+          and "https://mail.google.com/mail/u/0/" in focused_calls[0],
+          repr(focused_calls))
+    check("an already-open Gmail never launches Chrome again",
+          all("Google Chrome" not in "".join(map(str, call))
+              or call[0] == "/usr/bin/osascript"
+              for call in focused_calls),
+          repr(focused_calls))
+
+    missing_calls = []
+
+    def missing_then_launch(argv, **kwargs):
+        missing_calls.append(list(argv))
+        if argv and argv[0] == "/usr/bin/osascript":
+            return Result("missing\n")
+        return Result("", 0)
+
+    connector_module.subprocess.run = missing_then_launch
+    try:
+        c.launch(gmail)
+    finally:
+        connector_module.subprocess.run = original_run
+    fallback = missing_calls[-1] if missing_calls else []
+    check("missing work window still targets Chrome's Default profile",
+          "--profile-directory=Default" in fallback, repr(missing_calls))
+    check("missing work window opens Gmail without --new-window",
+          "https://mail.google.com/mail/u/0/" in fallback
+          and "--new-window" not in fallback, repr(missing_calls))
 
 
 def test_personal_chrome_focuses_or_creates_its_exact_profile() -> None:
@@ -1535,7 +1747,7 @@ def main() -> int:
     test_idle_and_old_are_dropped()
     test_merges_both_feeds()
     test_merges_native_desktop_surfaces()
-    test_t3_managed_provider_children_are_not_separate_buttons()
+    test_t3_managed_provider_children_follow_authoritative_thread_coverage()
     test_workspace_identity_collapses_cursor_project_mirrors()
     test_t3_cursor_thread_absorbs_matching_hook_and_hermes_shadows()
     test_pager_replaces_the_dead_overflow_key()
@@ -1554,6 +1766,10 @@ def main() -> int:
     test_status_icons_exist_for_every_status()
     test_a_second_result_with_the_same_status_still_announces_itself()
     test_a_dismissed_agent_returns_on_a_repeated_status()
+    test_a_dismissed_thread_stays_gone_when_it_briefly_leaves_the_feed()
+    test_a_working_turn_decaying_to_done_stays_acknowledged()
+    test_viewing_a_finished_hermes_thread_settles_to_done()
+    test_dismissals_survive_a_connector_restart()
     test_missing_and_corrupt_files()
     test_focus_command_receives_agent_fields()
     test_tty_reaches_the_focus_command()

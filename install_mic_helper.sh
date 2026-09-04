@@ -7,7 +7,7 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SOURCE="$ROOT/DeckbridgeMic.m"
 INFO_PLIST="$ROOT/DeckbridgeMic-Info.plist"
 APP_PATH="${DECKBRIDGE_MIC_APP:-$HOME/Applications/Deckbridge Mic.app}"
-EXPECTED_VERSION=11
+EXPECTED_VERSION=12
 
 helper_path() {
     printf '%s/Contents/MacOS/deckbridge-mic\n' "$APP_PATH"
@@ -67,11 +67,14 @@ install_helper() {
         return $?
     fi
     if [ -n "$current" ] && [ "$force" != 1 ]; then
-        printf 'refusing to replace trusted helper protocol %s with %s automatically\n' \
-            "$current" "$EXPECTED_VERSION" >&2
-        printf 'run `%s install --force` and re-enable Deckbridge Mic if macOS asks\n' \
-            "$0" >&2
-        return 2
+        if [ "$current" -ge "$EXPECTED_VERSION" ] 2>/dev/null; then
+            printf 'refusing to replace trusted helper protocol %s with %s automatically\n' \
+                "$current" "$EXPECTED_VERSION" >&2
+            printf 'run `%s install --force` and re-enable Deckbridge Mic if macOS asks\n' \
+                "$0" >&2
+            return 2
+        fi
+        printf 'upgrading Deckbridge Mic protocol %s -> %s\n' "$current" "$EXPECTED_VERSION"
     fi
     if [ ! -f "$SOURCE" ] || [ ! -f "$INFO_PLIST" ]; then
         printf 'helper source is incomplete in %s\n' "$ROOT" >&2

@@ -608,6 +608,43 @@ if FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT"; then
     fail '--launch needs no --source or --name'
   fi
 
+  # A second press of T3/Claude/Codex while that app is already frontmost
+  # starts a new thread. The first press only raises the app.
+  check_sh 'an unfocused T3 launcher only raises the app' \
+    'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+     printf "#!/bin/sh\necho \"Cursor|com.t3tools.other|1\"\n" > "$TMP_DIR/t3-unfocused";
+     chmod +x "$TMP_DIR/t3-unfocused";
+     DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-unfocused"; DRY_RUN=1;
+     launch_app "T3 Code (Alpha)" | grep -q "open -a T3 Code (Alpha)"'
+
+  check_sh 'a focused T3 launcher starts a new thread' \
+    'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+     printf "#!/bin/sh\necho \"T3 Code (Alpha)|com.t3tools.t3code|9\"\n" > "$TMP_DIR/t3-focused";
+     chmod +x "$TMP_DIR/t3-focused";
+     DECKBRIDGE_CONTROL_CLI="$TMP_DIR/t3-focused"; DRY_RUN=1;
+     launch_app "T3 Code (Alpha)" | grep -q "press New thread"'
+
+  check_sh 'a focused Claude launcher opens a new chat' \
+    'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+     printf "#!/bin/sh\necho \"Claude|com.anthropic.claudefordesktop|2\"\n" > "$TMP_DIR/claude-focused";
+     chmod +x "$TMP_DIR/claude-focused";
+     DECKBRIDGE_CONTROL_CLI="$TMP_DIR/claude-focused"; DRY_RUN=1;
+     launch_app Claude | grep -q "claude://claude.ai/new"'
+
+  check_sh 'a focused ChatGPT launcher opens a new thread' \
+    'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+     printf "#!/bin/sh\necho \"ChatGPT|com.openai.codex|3\"\n" > "$TMP_DIR/gpt-focused";
+     chmod +x "$TMP_DIR/gpt-focused";
+     DECKBRIDGE_CONTROL_CLI="$TMP_DIR/gpt-focused"; DRY_RUN=1;
+     launch_app ChatGPT | grep -q "codex://threads/new"'
+
+  check_sh 'a focused Discord launcher still only raises the app' \
+    'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+     printf "#!/bin/sh\necho \"Discord|com.hnc.Discord|4\"\n" > "$TMP_DIR/discord-focused";
+     chmod +x "$TMP_DIR/discord-focused";
+     DECKBRIDGE_CONTROL_CLI="$TMP_DIR/discord-focused"; DRY_RUN=1;
+     launch_app Discord | grep -q "open -a Discord"'
+
   if python_bin >/dev/null 2>&1; then
     pass 'python_bin finds an interpreter on a normal host'
   else

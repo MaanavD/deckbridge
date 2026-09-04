@@ -168,6 +168,23 @@ def main() -> int:
               and recovered_health["consecutive_failures"] == 0
               and recovered_health["agent_count"] == 1)
 
+        noisy = {
+            "agents": [
+                {"name": "Return PONG", "title": "Return PONG",
+                 "status": "done", "source": "hermes-ssh", "cwd": "/tmp"},
+                {"name": "real work", "title": "Fix the board",
+                 "status": "working", "source": "hermes-discord"},
+            ]
+        }
+        watcher.run_probe = lambda _args: noisy  # type: ignore[assignment]
+        try:
+            cleaned = watcher.poll_once(broken, reporter=reporter)
+        finally:
+            watcher.run_probe = original_run_probe
+        names = [a.get("name") for a in (cleaned or {}).get("agents", [])]
+        check("watcher drops Return PONG even if the remote probe still emits it",
+              names == ["real work"], str(names))
+
     passed = sum(ok for _, ok in RESULTS)
     print(f"\n{passed}/{len(RESULTS)} passed")
     return 0 if passed == len(RESULTS) else 1

@@ -22,7 +22,7 @@ if ! DECKBRIDGE_MIC_APP="$APP" "$ROOT/install_mic_helper.sh" install >/dev/null;
 fi
 HELPER="$APP/Contents/MacOS/deckbridge-mic"
 check test -x "$HELPER"
-check test "$("$HELPER" version)" = 9
+check test "$("$HELPER" version)" = 12
 check test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")" = com.deckbridge.mic-helper
 check /usr/bin/codesign --verify --deep --strict "$APP"
 
@@ -33,6 +33,7 @@ check /usr/bin/codesign --verify --deep --strict "$APP"
 check test "$("$HELPER" event-shape 63 down function)" = 'flags-changed|8388608'
 check test "$("$HELPER" event-shape 63 up function)" = 'flags-changed|0'
 check test "$("$HELPER" event-shape 2 down control,shift)" = 'key-down|393216'
+check test "$("$HELPER" event-shape mic)" = 'aux|207'
 
 set +e
 web_url_usage="$("$HELPER" web-url 2>&1)"

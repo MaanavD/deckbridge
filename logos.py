@@ -127,7 +127,7 @@ BADGE_LETTER = {
     "herdr": "E",
     "cmux": "M",
     "slack": "L",
-    "gmail": "G",
+    "gmail": "W",
     "google-chrome": "P",
     "notion-calendar": "N",
 }

@@ -11,6 +11,41 @@ export DECKBRIDGE_MIC_GESTURE_STATE="$TMP_DIR/mic-gesture"
 # The developer machine may itself be at loginwindow while this runs. Keep all
 # ordinary fixtures explicitly unlocked; the dedicated lock case overrides it.
 export DECKBRIDGE_FAKE_SCREEN_LOCKED=0
+# Hammerspoon is often running on the developer Mac. Tests that are not the
+# LaunchAgent fallback must not send live URL events (or start Dictation).
+export DECKBRIDGE_DISABLE_HAMMERSPOON=1
+# Isolation: do not read the developer Mac's Keyboard > Dictation shortcut.
+# Empty or disabled 164 falls back to Left Command twice, not Globe or mic.
+EMPTY_HOTKEYS_PLIST="$TMP_DIR/empty-symbolichotkeys.plist"
+CMD_TWICE_HOTKEYS_PLIST="$TMP_DIR/cmd-twice-symbolichotkeys.plist"
+DISABLED_HOTKEYS_PLIST="$TMP_DIR/disabled-symbolichotkeys.plist"
+python3 - "$EMPTY_HOTKEYS_PLIST" "$CMD_TWICE_HOTKEYS_PLIST" "$DISABLED_HOTKEYS_PLIST" <<'PY'
+import plistlib, sys
+plistlib.dump({"AppleSymbolicHotKeys": {}}, open(sys.argv[1], "wb"))
+plistlib.dump({
+    "AppleSymbolicHotKeys": {
+        "164": {
+            "enabled": True,
+            "value": {
+                "type": "modifier",
+                "parameters": [1048584, 18446744073708503031],
+            },
+        }
+    }
+}, open(sys.argv[2], "wb"))
+plistlib.dump({
+    "AppleSymbolicHotKeys": {
+        "164": {
+            "enabled": False,
+            "value": {
+                "type": "standard",
+                "parameters": [65535, 65535, 0],
+            },
+        }
+    }
+}, open(sys.argv[3], "wb"))
+PY
+export DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST="$EMPTY_HOTKEYS_PLIST"
 
 passed=0
 total=0
@@ -205,7 +240,7 @@ out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
     DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
     bash "$SCRIPT" --dry-run)"
 check contains "$out" 'Start Dictation'
-check contains "$out" 'hotkey fn,fn fallback'
+check contains "$out" 'hotkey cmd,cmd fallback'
 
 # A dry-run must not execute a configured shell command.
 marker="$TMP_DIR/dry-run-marker"
@@ -325,8 +360,9 @@ DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
 bash "$SCRIPT" --release >/dev/null
 check contains "$(cat "$helper_log")" 'tap 2 command,shift'
 
-# Universal voice uses the configured macOS Dictation shortcut. AXPress can
-# return success for Start Dictation without DictationIM actually launching.
+# Universal voice prefers Edit > Start Dictation. The Keyboard shortcut is
+# only the fallback. Release must not fire a second start or the only sound
+# is the end chime.
 : > "$helper_log"
 out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
     DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
@@ -335,14 +371,27 @@ out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
     DECKBRIDGE_MIC_HELPER="$fake_helper" \
     DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
     bash "$SCRIPT" --press)"
-check contains "$out" 'gesture=hold'
-check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 2
-check excludes "$(cat "$helper_log")" 'start-dictation'
+check excludes "$out" 'gesture=hold'
+check contains "$out" 'dictation_hotkey=cmd,cmd'
+check contains "$(cat "$helper_log")" 'start-dictation'
+check excludes "$(cat "$helper_log")" 'tap-mic'
+check excludes "$(cat "$helper_log")" 'tap 55 command'
+check excludes "$(cat "$helper_log")" 'tap 63 function'
 : > "$helper_log"
 DECKBRIDGE_MIC_HELPER="$fake_helper" \
 DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
 bash "$SCRIPT" --release >/dev/null
-check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 2
+check excludes "$(cat "$helper_log")" 'start-dictation'
+check excludes "$(cat "$helper_log")" 'tap 55 command'
+: > "$helper_log"
+DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+DECKBRIDGE_FAKE_ACCESSIBILITY_ENABLED=1 \
+DECKBRIDGE_MIC_HELPER="$fake_helper" \
+DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
+bash "$SCRIPT" --press >/dev/null
+check contains "$(cat "$helper_log")" 'start-dictation'
 
 : > "$helper_log"
 DECKBRIDGE_DICTATION_HOTKEY=fn,fn \
@@ -361,7 +410,59 @@ DECKBRIDGE_FAKE_NO_DICTATION_MENU=1 \
 DECKBRIDGE_MIC_HELPER="$fake_helper" \
 DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
 bash "$SCRIPT" --release >/dev/null
-check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 2
+check test "$(grep -c '^tap 63 function$' "$helper_log")" -eq 0
+
+# Keyboard > Dictation > Shortcut on this Mac is Left Command twice
+# (symbolic hotkey 164, 0x100008). Guessing Globe/Fn opens Character Viewer
+# instead and plays a different sound than Dictation.
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST="$CMD_TWICE_HOTKEYS_PLIST" \
+    DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+    bash "$SCRIPT" --dry-run)"
+check contains "$out" 'hotkey cmd,cmd fallback'
+check excludes "$out" 'hotkey fn,fn fallback'
+: > "$helper_log"
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST="$CMD_TWICE_HOTKEYS_PLIST" \
+    DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+    DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+    DECKBRIDGE_FAKE_ACCESSIBILITY_ENABLED=1 \
+    DECKBRIDGE_MIC_HELPER="$fake_helper" \
+    DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
+    bash "$SCRIPT" --press)"
+check excludes "$out" 'gesture=hold'
+check contains "$out" 'dictation_hotkey=cmd,cmd'
+check contains "$(cat "$helper_log")" 'start-dictation'
+check excludes "$(cat "$helper_log")" 'tap 55 command'
+check excludes "$(cat "$helper_log")" 'tap 63 function'
+: > "$helper_log"
+DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST="$CMD_TWICE_HOTKEYS_PLIST" \
+DECKBRIDGE_MIC_HELPER="$fake_helper" \
+DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
+bash "$SCRIPT" --release >/dev/null
+check excludes "$(cat "$helper_log")" 'start-dictation'
+check excludes "$(cat "$helper_log")" 'tap 55 command'
+check excludes "$(cat "$helper_log")" 'tap 63 function'
+
+: > "$helper_log"
+DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST="$CMD_TWICE_HOTKEYS_PLIST" \
+DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+DECKBRIDGE_FAKE_ACCESSIBILITY_ENABLED=1 \
+DECKBRIDGE_FAKE_NO_DICTATION_MENU=1 \
+DECKBRIDGE_MIC_HELPER="$fake_helper" \
+DECKBRIDGE_FAKE_HELPER_LOG="$helper_log" \
+bash "$SCRIPT" --press >/dev/null
+check test "$(grep -c '^tap 55 command$' "$helper_log")" -eq 2
+
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST="$DISABLED_HOTKEYS_PLIST" \
+    DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+    bash "$SCRIPT" --dry-run)"
+check contains "$out" 'hotkey cmd,cmd fallback'
+check excludes "$out" 'hotkey mic fallback'
+check excludes "$out" 'hotkey fn,fn fallback'
 
 # Claude Code's hold mode maps to a real Space key-down/key-up pair.
 : > "$helper_log"
@@ -426,6 +527,124 @@ out="$(PATH="$fake_bin:$PATH" \
     DECKBRIDGE_FAKE_ACCESSIBILITY_ENABLED=1 \
     bash "$SCRIPT" --check 2>&1 || true)"
 check contains "$out" 'ready=yes'
+
+# Launchd is a different TCC parent than Terminal. The signed helper can be
+# trusted interactively and still return exit 4 from the LaunchAgent. T3
+# focus already uses Hammerspoon's durable grant; dictation must too.
+untrusted_helper="$TMP_DIR/untrusted-helper"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$1" in' \
+    '  frontmost) printf "Notes|com.apple.Notes|1\n" ;;' \
+    '  check|tap|key-down|key-up|focus-text-entry)' \
+    '    printf "Deckbridge Mic is not trusted. Enable it in Accessibility.\n" >&2' \
+    '    exit 4 ;;' \
+    '  *) exit 2 ;;' \
+    'esac' > "$untrusted_helper"
+chmod +x "$untrusted_helper"
+
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+    DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+    DECKBRIDGE_FAKE_HAMMERSPOON=0 \
+    DECKBRIDGE_MIC_HELPER="$untrusted_helper" \
+    bash "$SCRIPT" --check 2>&1 || true)"
+check contains "$out" 'ready=no'
+check contains "$out" 'Accessibility'
+
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+    DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+    DECKBRIDGE_FAKE_HAMMERSPOON=1 \
+    DECKBRIDGE_MIC_HELPER="$untrusted_helper" \
+    bash "$SCRIPT" --check 2>&1)"
+check contains "$out" 'ready=yes'
+
+hs_open="$TMP_DIR/hs-open"
+hs_open_log="$TMP_DIR/hs-open.log"
+hs_results="$TMP_DIR/dictation-results"
+mkdir -p "$hs_results"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'printf "%s\n" "$*" >> "$DECKBRIDGE_FAKE_OPEN_LOG"' \
+    'for arg in "$@"; do' \
+    '  case "$arg" in hammerspoon://deckbridge-dictation*) url=$arg ;; esac' \
+    'done' \
+    '[ -n "$url" ] || exit 0' \
+    'request=$(printf "%s" "${url#*\?}" | tr "&" "\n" | sed -n "s/^request=//p")' \
+    'mkdir -p "$DECKBRIDGE_DICTATION_RESULT_DIR"' \
+    'printf "ok\n" > "$DECKBRIDGE_DICTATION_RESULT_DIR/$request"' > "$hs_open"
+chmod +x "$hs_open"
+
+: > "$hs_open_log"
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+    DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+    DECKBRIDGE_FAKE_HAMMERSPOON=1 \
+    DECKBRIDGE_MIC_HELPER="$untrusted_helper" \
+    DECKBRIDGE_MIC_OPEN="$hs_open" \
+    DECKBRIDGE_FAKE_OPEN_LOG="$hs_open_log" \
+    DECKBRIDGE_DICTATION_RESULT_DIR="$hs_results" \
+    bash "$SCRIPT" --press)"
+check excludes "$out" 'gesture=hold'
+check contains "$(cat "$hs_open_log")" 'hammerspoon://deckbridge-dictation?op=start-dictation'
+check contains "$(cat "$hs_open_log")" 'hotkey=cmd,cmd'
+check test "$(grep -c 'hammerspoon://deckbridge-dictation?op=start-dictation' "$hs_open_log")" -eq 1
+check excludes "$(cat "$hs_open_log")" 'op=tap'
+check excludes "$(cat "$hs_open_log")" 'op=toggle-dictation'
+
+: > "$hs_open_log"
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST="$CMD_TWICE_HOTKEYS_PLIST" \
+    DECKBRIDGE_FAKE_FRONTMOST='Notes|com.apple.Notes' \
+    DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+    DECKBRIDGE_FAKE_HAMMERSPOON=1 \
+    DECKBRIDGE_MIC_HELPER="$untrusted_helper" \
+    DECKBRIDGE_MIC_OPEN="$hs_open" \
+    DECKBRIDGE_FAKE_OPEN_LOG="$hs_open_log" \
+    DECKBRIDGE_DICTATION_RESULT_DIR="$hs_results" \
+    bash "$SCRIPT" --press)"
+check excludes "$out" 'gesture=hold'
+check contains "$(cat "$hs_open_log")" 'hotkey=cmd,cmd'
+check excludes "$(cat "$hs_open_log")" 'hotkey=fn,fn'
+
+# T3 used to abort the whole press when launchd-denied focus-text-entry
+# returned 4, so dictation never ran even though Hammerspoon could post Fn.
+t3_helper="$TMP_DIR/t3-untrusted-helper"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'case "$1" in' \
+    '  frontmost) printf "T3 Code (Alpha)|com.t3tools.t3code|1\n" ;;' \
+    '  check|tap|key-down|key-up|focus-text-entry)' \
+    '    printf "Deckbridge Mic is not trusted. Enable it in Accessibility.\n" >&2' \
+    '    exit 4 ;;' \
+    '  *) exit 2 ;;' \
+    'esac' > "$t3_helper"
+chmod +x "$t3_helper"
+: > "$hs_open_log"
+out="$(DECKBRIDGE_MIC_CONFIG="$TMP_DIR/no-config" \
+    DECKBRIDGE_FAKE_FRONTMOST='T3 Code (Alpha)|com.t3tools.t3code' \
+    DECKBRIDGE_FAKE_DICTATION_ENABLED=1 \
+    DECKBRIDGE_FAKE_HAMMERSPOON=1 \
+    DECKBRIDGE_MIC_HELPER="$t3_helper" \
+    DECKBRIDGE_MIC_OPEN="$hs_open" \
+    DECKBRIDGE_FAKE_OPEN_LOG="$hs_open_log" \
+    DECKBRIDGE_DICTATION_RESULT_DIR="$hs_results" \
+    bash "$SCRIPT" --press)"
+check excludes "$out" 'gesture=hold'
+check contains "$(cat "$hs_open_log")" 'op=focus-text-entry'
+check contains "$(cat "$hs_open_log")" 'op=start-dictation'
+
+check grep -q 'hs.urlevent.bind("deckbridge-dictation"' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
+check grep -q 'Start Dictation' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
+check grep -q 'runMicHelper' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
+check grep -q 'toggleNativeDictation' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
+check grep -q 'tap-mic' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
+check grep -q 'code = 55' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
+if command -v hs >/dev/null 2>&1; then
+    lua_load="$(hs -c "local f, err = loadfile('$SCRIPT_DIR/hammerspoon_deckbridge.lua'); print(f and 'load-ok' or err)" 2>/dev/null || true)"
+    check contains "$lua_load" 'load-ok'
+fi
 
 printf '%s/%s passed\n' "$passed" "$total"
 [ "$passed" -eq "$total" ]

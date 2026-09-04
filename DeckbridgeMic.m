@@ -87,6 +87,27 @@ static CGEventFlags event_flags_for_key(CGKeyCode code, bool down,
     return down ? flags : (flags & ~own_flag);
 }
 
+static void post_aux_key(uint32_t key, bool down) {
+    // The MacBook microphone/dictation key is a HID consumer control
+    // (Voice Command, 0xCF), posted as NX_SYSDEFINED subtype 8. A normal
+    // F5 keyDown (virtual key 96) is a different event and does not start
+    // Dictation even when Keyboard > Dictation > Shortcut is Microphone.
+    NSInteger data1 = (NSInteger)((key << 16) | ((down ? 0xa : 0xb) << 8));
+    NSEvent *event = [NSEvent otherEventWithType:NSEventTypeSystemDefined
+                                        location:NSZeroPoint
+                                   modifierFlags:(down ? 0xa00 : 0xb00)
+                                       timestamp:0
+                                    windowNumber:0
+                                         context:nil
+                                         subtype:8
+                                           data1:data1
+                                           data2:-1];
+    if (!event) fail(@"could not construct special-key event", 1);
+    CGEventRef cg_event = [event CGEvent];
+    if (!cg_event) fail(@"could not convert special-key event", 1);
+    CGEventPost(kCGHIDEventTap, cg_event);
+}
+
 static void post_key(CGKeyCode code, bool down, CGEventFlags flags) {
     CGEventSourceRef source = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     if (!source) fail(@"could not construct keyboard event source", 1);
@@ -571,9 +592,12 @@ int main(int argc, const char *argv[]) {
         }
         NSString *command = arguments.count ? arguments[0] : @"request-access";
         if ([command isEqualToString:@"version"]) {
-            return complete(@"11", 0, NO);
+            return complete(@"12", 0, NO);
         }
         if ([command isEqualToString:@"event-shape"]) {
+            if (arguments.count == 2 && [arguments[1] isEqualToString:@"mic"]) {
+                return complete(@"aux|207", 0, NO);
+            }
             if (arguments.count != 4) {
                 fail(@"usage: deckbridge-mic event-shape <key-code> <down|up> <flags|none>", 2);
             }
@@ -672,6 +696,15 @@ int main(int argc, const char *argv[]) {
             if (arguments.count != 2) fail(@"usage: deckbridge-mic focus-text-entry <bundle-id>", 2);
             if (!AXIsProcessTrusted()) fail(@"Deckbridge Mic is not trusted. Enable it in Accessibility.", 4);
             focus_text_entry(arguments[1]);
+            return complete(@"", 0, NO);
+        }
+        if ([command isEqualToString:@"tap-mic"]) {
+            if (!AXIsProcessTrusted()) {
+                fail(@"Deckbridge Mic is not trusted. Open System Settings > Privacy & Security > Accessibility and enable Deckbridge Mic.", 4);
+            }
+            post_aux_key(0xCF, true);
+            usleep(20000);
+            post_aux_key(0xCF, false);
             return complete(@"", 0, NO);
         }
         if (![command isEqualToString:@"tap"] &&

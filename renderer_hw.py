@@ -339,7 +339,7 @@ class HWRenderer:
             if action_layout:
                 draw.text(
                     (w / 2, h - 7),
-                    (face.get("sublabel") or "hold to talk").upper(),
+                    (face.get("sublabel") or "dictation").upper(),
                     font=self.font_small or ImageFont.load_default(),
                     anchor="mm", fill="white",
                 )

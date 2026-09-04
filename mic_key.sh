@@ -28,10 +28,9 @@
 # feature, slash command, or hotkey in the CLI documentation. It falls back to
 # macOS Dictation rather than fabricating a Codex CLI shortcut.
 # https://developers.openai.com/codex/cli
-# VERIFIED: macOS Dictation starts from the Keyboard > Dictation shortcut; Apple
-# documents the configurable shortcut, Microphone key, and Edit > Start Dictation.
-# The shortcut varies by macOS/keyboard settings; this script defaults to
-# Apple's long-standing Press Fn/Globe Twice and permits overrides.
+# VERIFIED: macOS Dictation starts from Edit > Start Dictation; Apple also
+# documents the Keyboard > Dictation shortcut and the Microphone key.
+# This script prefers the Edit menu and falls back to Left Command twice.
 # https://support.apple.com/guide/mac-help/use-dictation-mh40584/mac
 # VERIFIED: cmux is a native macOS terminal with scriptable panes and supports
 # terminal agents; process inspection below is deliberately best-effort.
@@ -55,8 +54,8 @@
 # `keycode:N`, and `keycode:N+modifier+modifier`; any other value is executed
 # as an explicit /bin/sh command. Example:
 #   other=logger -t deckbridge "mic key"
-#   dictation_hotkey=fn,fn
-# Hotkey names supported: ctrl, fn, f5, or a numeric key code, comma-separated.
+#   dictation_hotkey=cmd,cmd
+# Hotkey names supported: cmd, ctrl, fn, mic, f5, or a numeric key code.
 # DECKBRIDGE_DICTATION_HOTKEY overrides dictation_hotkey.
 
 set -u
@@ -82,13 +81,13 @@ ACTION_CLAUDE_DESKTOP="dictation"
 ACTION_CURSOR="cursor-hold"
 ACTION_TERMINAL_UNKNOWN="dictation"
 ACTION_OTHER="dictation"
-# Keep this aligned with Keyboard > Dictation > Shortcut. The former "Press
-# microphone key" setting is a hardware consumer-key event: synthesizing the
-# F5 key position returned success but never started Dictation. Double Globe
-# is represented by ordinary flagsChanged events and is reliable for the
-# helper to post. Users who intentionally choose another shortcut can still
-# override this in mic_targets.conf or DECKBRIDGE_DICTATION_HOTKEY.
-CONFIG_DICTATION_HOTKEY="fn,fn"
+# Prefer Edit > Start Dictation. The Keyboard shortcut is only a fallback, and
+# this repo defaults that fallback to Left Command twice. Command/Control/Fn
+# twice still decode from enabled symbolic hotkey 164. Disabled or missing 164
+# is not the hardware microphone key. Override with mic_targets.conf or
+# DECKBRIDGE_DICTATION_HOTKEY.
+CONFIG_DICTATION_HOTKEY=""
+DEFAULT_DICTATION_HOTKEY="cmd,cmd"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 MIC_HELPER_APP="${DECKBRIDGE_MIC_APP:-$HOME/Applications/Deckbridge Mic.app}"
 MIC_HELPER="${DECKBRIDGE_MIC_HELPER:-$MIC_HELPER_APP/Contents/MacOS/deckbridge-mic}"
@@ -96,6 +95,8 @@ MIC_HELPER_INSTALLER="${DECKBRIDGE_MIC_INSTALLER:-$SCRIPT_DIR/install_mic_helper
 MIC_OPEN_WAS_SET="${DECKBRIDGE_MIC_OPEN+x}"
 MIC_OPEN="${DECKBRIDGE_MIC_OPEN:-/usr/bin/open}"
 MIC_GESTURE_STATE="${DECKBRIDGE_MIC_GESTURE_STATE:-$HOME/.deckbridge/mic_gesture}"
+DICTATION_RESULT_DIR="${DECKBRIDGE_DICTATION_RESULT_DIR:-$HOME/.deckbridge/dictation-results}"
+MIC_HS_SEQ=0
 
 trim() {
     printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
@@ -107,6 +108,9 @@ trim() {
 # instance and falsely report setup-required even while the same signed binary
 # returned ready=yes. The older result-file route remains as an explicit
 # DECKBRIDGE_MIC_OPEN compatibility/test seam.
+# HID posts still fall back to Hammerspoon when launchd is the responsible
+# parent: macOS can deny the same trusted helper in that chain, which is why
+# T3 focus already uses hammerspoon:// URL events.
 run_helper() {
     local result_dir result_file ticks max_ticks helper_rc helper_detail
     if [ -n "${DECKBRIDGE_MIC_HELPER:-}" ] || [ -z "$MIC_OPEN_WAS_SET" ]; then
@@ -157,6 +161,109 @@ run_helper() {
         return 7
     fi
     return "$helper_rc"
+}
+
+hammerspoon_gui_ready() {
+    fake="${DECKBRIDGE_FAKE_HAMMERSPOON:-}"
+    if [ -n "$fake" ]; then
+        [ "$fake" = "1" ]
+        return $?
+    fi
+    [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] || return 1
+    pgrep -x Hammerspoon >/dev/null 2>&1
+}
+
+hammerspoon_invoke() {
+    local op="$1" code="${2:-}" flags="${3:-none}" bundle="${4:-}"
+    local request result_file polls selected url hotkey
+    hammerspoon_gui_ready || return 1
+    [ -x "$MIC_OPEN" ] || return 1
+    MIC_HS_SEQ=$((MIC_HS_SEQ + 1))
+    request="$$-$(date +%s)-$MIC_HS_SEQ"
+    mkdir -p "$DICTATION_RESULT_DIR" || return 1
+    result_file="$DICTATION_RESULT_DIR/$request"
+    rm -f "$result_file"
+    url="hammerspoon://deckbridge-dictation?op=${op}&request=${request}"
+    case "$op" in
+        tap|key-down|key-up)
+            url="${url}&code=${code}&flags=${flags}"
+            ;;
+        tap-mic)
+            ;;
+        start-dictation|stop-dictation|toggle-dictation)
+            hotkey="$(dictation_hotkey)"
+            url="${url}&hotkey=${hotkey}"
+            ;;
+        focus-text-entry)
+            url="${url}&bundle=${bundle}"
+            ;;
+        *) return 1 ;;
+    esac
+    "$MIC_OPEN" -g -a Hammerspoon "$url" >/dev/null 2>&1 || return 1
+    polls=0
+    while [ "$polls" -lt "${DECKBRIDGE_MIC_RESULT_TIMEOUT_TICKS:-60}" ]; do
+        if [ -f "$result_file" ]; then
+            selected="$(cat "$result_file" 2>/dev/null || true)"
+            rm -f "$result_file"
+            case "$selected" in
+                ok) return 0 ;;
+            esac
+            return 1
+        fi
+        polls=$((polls + 1))
+        sleep 0.05
+    done
+    return 1
+}
+
+# Post a key through Deckbridge Mic when launchd still inherits that grant.
+# Exit 4 means macOS denied the helper for this parent; Hammerspoon's GUI
+# identity can still synthesize the same HID events.
+run_hid() {
+    local command="$1" code="$2" flags="$3" err rc
+    err="$(mktemp "${TMPDIR:-/tmp}/deckbridge-mic-hid.XXXXXX")" || return 7
+    run_helper "$command" "$code" "$flags" >"$err" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        [ -s "$err" ] && cat "$err"
+        rm -f "$err"
+        return 0
+    fi
+    if [ "$rc" -eq 4 ] && hammerspoon_invoke "$command" "$code" "$flags"; then
+        rm -f "$err"
+        return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return "$rc"
+}
+
+run_hid_cmd() {
+    local command="$1" err rc
+    err="$(mktemp "${TMPDIR:-/tmp}/deckbridge-mic-hid.XXXXXX")" || return 7
+    run_helper "$command" >"$err" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        [ -s "$err" ] && cat "$err"
+        rm -f "$err"
+        return 0
+    fi
+    if [ "$rc" -eq 4 ] && hammerspoon_invoke "$command"; then
+        rm -f "$err"
+        return 0
+    fi
+    cat "$err" >&2
+    rm -f "$err"
+    return "$rc"
+}
+
+focus_t3_prompt() {
+    [ "$TARGET" = "t3code" ] || return 0
+    if run_helper focus-text-entry com.t3tools.t3code >/dev/null 2>&1; then
+        return 0
+    fi
+    hammerspoon_invoke focus-text-entry "" none com.t3tools.t3code || true
+    return 0
 }
 
 load_config() {
@@ -472,7 +579,7 @@ describe_action() {
     action="$1"
     case "$action" in
         dictation)
-            printf 'Deckbridge Mic: focused app Edit > Start Dictation (hotkey %s fallback)\n' "${DECKBRIDGE_DICTATION_HOTKEY:-$CONFIG_DICTATION_HOTKEY}"
+            printf 'Deckbridge Mic: focused app Edit > Start Dictation (hotkey %s fallback)\n' "$(dictation_hotkey)"
             ;;
         keycode:*)
             parts="$(native_keycode_parts "$action" 2>/dev/null || true)"
@@ -521,8 +628,10 @@ accessibility_enabled() {
         [ "$fake" = "1" ]
         return $?
     fi
-    [ -x "$MIC_HELPER" ] || return 1
-    run_helper check >/dev/null 2>&1
+    if [ -x "$MIC_HELPER" ] && run_helper check >/dev/null 2>&1; then
+        return 0
+    fi
+    hammerspoon_gui_ready
 }
 
 preflight_action() {
@@ -563,8 +672,84 @@ preflight_action() {
     return "$preflight_rc"
 }
 
+detect_system_dictation_hotkey() {
+    fake_plist="${DECKBRIDGE_FAKE_SYMBOLIC_HOTKEYS_PLIST:-}"
+    python_bin=""
+    if [ -x /usr/bin/python3 ]; then
+        python_bin=/usr/bin/python3
+    elif command -v python3 >/dev/null 2>&1; then
+        python_bin="$(command -v python3)"
+    else
+        return 1
+    fi
+    "$python_bin" - "$fake_plist" <<'PY'
+import plistlib, subprocess, sys
+
+def decode_modifier(code):
+    code = int(code) & 0xFFFFFFFF
+    if code & 0x00100008 == 0x00100008:
+        return "cmd,cmd"
+    if code & 0x00100010 == 0x00100010:
+        return "rcmd,rcmd"
+    if code & 0x00800000:
+        return "fn,fn"
+    if code & 0x00040000:
+        return "ctrl,ctrl"
+    if code & 0x00100000:
+        return "cmd,cmd"
+    return ""
+
+fake = sys.argv[1]
+try:
+    if fake:
+        with open(fake, "rb") as handle:
+            plist = plistlib.load(handle)
+    else:
+        raw = subprocess.check_output(
+            ["defaults", "export", "com.apple.symbolichotkeys", "-"]
+        )
+        plist = plistlib.loads(raw)
+except Exception:
+    sys.exit(1)
+
+keys = plist.get("AppleSymbolicHotKeys") or {}
+entry = keys.get(164)
+if entry is None:
+    entry = keys.get("164")
+if not isinstance(entry, dict) or not entry.get("enabled"):
+    sys.exit(1)
+value = entry.get("value") or {}
+params = value.get("parameters") or []
+kind = value.get("type") or ""
+if kind == "modifier" and params:
+    decoded = decode_modifier(params[0])
+    if decoded:
+        print(decoded)
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+dictation_hotkey() {
+    if [ -n "${DECKBRIDGE_DICTATION_HOTKEY:-}" ]; then
+        printf '%s\n' "$DECKBRIDGE_DICTATION_HOTKEY"
+        return 0
+    fi
+    if [ -n "$CONFIG_DICTATION_HOTKEY" ]; then
+        printf '%s\n' "$CONFIG_DICTATION_HOTKEY"
+        return 0
+    fi
+    detected="$(detect_system_dictation_hotkey 2>/dev/null || true)"
+    if [ -n "$detected" ]; then
+        printf '%s\n' "$detected"
+        return 0
+    fi
+    printf '%s\n' "$DEFAULT_DICTATION_HOTKEY"
+}
+
 tap_dictation_hotkey() {
-    hotkey="${DECKBRIDGE_DICTATION_HOTKEY:-$CONFIG_DICTATION_HOTKEY}"
+    hotkey="$(dictation_hotkey)"
+    [ "$hotkey" != "none" ] && [ -n "$hotkey" ] || return 1
     IFS=',' read -r -a hotkey_parts <<EOF
 $hotkey
 EOF
@@ -572,29 +757,45 @@ EOF
         part="$(trim "$part")"
         case "$part" in
             ctrl|control) code=59; flags=control ;;
+            cmd|command) code=55; flags=command ;;
+            rcmd|rightcommand) code=54; flags=command ;;
             fn|globe) code=63; flags=function ;;
-            f5|mic|microphone) code=96; flags=none ;;
+            f5) code=96; flags=none ;;
+            mic|microphone)
+                run_hid_cmd tap-mic || return $?
+                continue
+                ;;
             '') continue ;;
             *[!0-9]*)
                 printf 'Unsupported dictation hotkey component: %s\n' "$part" >&2
                 return 2 ;;
             *) code="$part"; flags=none ;;
         esac
-        run_helper tap "$code" "$flags" || return $?
+        run_hid tap "$code" "$flags" || return $?
         sleep 0.1
     done
 }
 
 start_dictation() {
-    # AXPress only proves that the menu item accepted a click. On current
-    # macOS, TextEdit returned success without launching DictationIM, creating
-    # a false-green key. The configured system shortcut is the authoritative
-    # Dictation trigger and works consistently across native, Electron, and
-    # terminal text fields.
+    # Menu first. The Keyboard shortcut is a last resort because a guessed
+    # chord (Globe, F5, microphone key) plays the wrong sound.
+    printf 'dictation_hotkey=%s\n' "$(dictation_hotkey)"
+    if hammerspoon_gui_ready && hammerspoon_invoke start-dictation; then
+        return 0
+    fi
+    if run_helper start-dictation >/dev/null 2>&1; then
+        return 0
+    fi
     tap_dictation_hotkey
 }
 
 stop_dictation() {
+    if hammerspoon_gui_ready && hammerspoon_invoke stop-dictation; then
+        return 0
+    fi
+    if run_helper stop-dictation >/dev/null 2>&1; then
+        return 0
+    fi
     tap_dictation_hotkey
 }
 
@@ -618,19 +819,23 @@ release_active_gesture() {
     gesture="$(sed -n '1p' "$MIC_GESTURE_STATE")"
     rc=0
     case "$gesture" in
-        dictation) stop_dictation || rc=$? ;;
+        dictation)
+            # Finger-up must not toggle Dictation a second time.
+            rm -f "$MIC_GESTURE_STATE"
+            return 0
+            ;;
         cursor-hold) release_cursor_hold || rc=$? ;;
         toggle-hold:*)
             parts="$(native_keycode_parts "keycode:${gesture#toggle-hold:}")" || return $?
             code="${parts%%|*}"
             flags="${parts#*|}"
-            run_helper tap "$code" "$flags" || rc=$?
+            run_hid tap "$code" "$flags" || rc=$?
             ;;
         key-hold:*)
             parts="$(native_keycode_parts "keycode:${gesture#key-hold:}")" || return $?
             code="${parts%%|*}"
             flags="${parts#*|}"
-            run_helper key-up "$code" "$flags" || rc=$?
+            run_hid key-up "$code" "$flags" || rc=$?
             ;;
         *)
             printf 'Unknown saved voice gesture: %s\n' "$gesture" >&2
@@ -645,8 +850,8 @@ release_active_gesture() {
 
 release_cursor_hold() {
     rc=0
-    run_helper key-up 46 control || rc=$?
-    run_helper key-up 59 none || rc=$?
+    run_hid key-up 46 control || rc=$?
+    run_hid key-up 59 none || rc=$?
     return "$rc"
 }
 
@@ -661,25 +866,20 @@ execute_action() {
     case "$action" in
         dictation)
             start_dictation || return $?
-            record_gesture dictation || {
-                stop_dictation >/dev/null 2>&1 || true
-                return 7
-            }
-            printf 'gesture=hold\n'
             ;;
         keycode:*)
             parts="$(native_keycode_parts "$action")" || return $?
             code="${parts%%|*}"
             flags="${parts#*|}"
-            run_helper tap "$code" "$flags"
+            run_hid tap "$code" "$flags"
             ;;
         toggle-hold:*)
             parts="$(native_keycode_parts "keycode:${action#toggle-hold:}")" || return $?
             code="${parts%%|*}"
             flags="${parts#*|}"
-            run_helper tap "$code" "$flags" || return $?
+            run_hid tap "$code" "$flags" || return $?
             record_gesture "$action" || {
-                run_helper tap "$code" "$flags" >/dev/null 2>&1 || true
+                run_hid tap "$code" "$flags" >/dev/null 2>&1 || true
                 return 7
             }
             printf 'gesture=hold\n'
@@ -688,18 +888,18 @@ execute_action() {
             parts="$(native_keycode_parts "keycode:${action#key-hold:}")" || return $?
             code="${parts%%|*}"
             flags="${parts#*|}"
-            run_helper key-down "$code" "$flags" || return $?
+            run_hid key-down "$code" "$flags" || return $?
             record_gesture "$action" || {
-                run_helper key-up "$code" "$flags" >/dev/null 2>&1 || true
+                run_hid key-up "$code" "$flags" >/dev/null 2>&1 || true
                 return 7
             }
             printf 'gesture=hold\n'
             ;;
         cursor-hold)
-            run_helper key-down 59 control || return $?
-            run_helper key-down 46 control || {
+            run_hid key-down 59 control || return $?
+            run_hid key-down 46 control || {
                 rc=$?
-                run_helper key-up 59 none >/dev/null 2>&1 || true
+                run_hid key-up 59 none >/dev/null 2>&1 || true
                 return "$rc"
             }
             record_gesture cursor-hold || {
@@ -838,7 +1038,7 @@ case "${1:-}" in
         # before invoking macOS Dictation so press/hold/release works even when
         # the user last clicked the sidebar or transcript.
         if [ "$TARGET" = "t3code" ]; then
-            run_helper focus-text-entry com.t3tools.t3code || exit $?
+            focus_t3_prompt
         fi
         execute_action "$(action_for_target)" press
         exit $?
