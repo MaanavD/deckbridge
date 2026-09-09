@@ -200,7 +200,7 @@ have_dep() { $PY -c "import $1" 2>/dev/null; }
 detect_hermes_ssh() {
   [ -f "$HOME/.ssh/config" ] || return 1
   local alias
-  for alias in hermes hetzner; do
+  for alias in surface-hermes hermes hetzner; do
     # Match the alias as a whole word in a Host line: `Host hermes` and
     # `Host hermes hermes-old` both count, `Host hermesque` does not.
     if grep -qiE "^[[:space:]]*Host([[:space:]]+[^[:space:]]+)*[[:space:]]+${alias}([[:space:]]|$)" \
@@ -362,7 +362,11 @@ start() {
     # a one-shot startup preflight used to omit it permanently until the whole
     # stack was restarted after Tailscale/SSH recovered.
     local hermes_args=(hermes_agents_watcher.py --ssh "$HERMES_SSH")
-    [ -z "$DISCORD_GUILD_ID" ] || hermes_args+=(--guild-id "$DISCORD_GUILD_ID")
+    local hermes_guild="$DISCORD_GUILD_ID"
+    if [ -z "$hermes_guild" ]; then
+      hermes_guild=$(read_remote_env "$HERMES_SSH" DISCORD_GUILD_ID || true)
+    fi
+    [ -z "$hermes_guild" ] || hermes_args+=(--guild-id "$hermes_guild")
     spawn hermes_agents "$PY" "${hermes_args[@]}"
   else
     skip "hermes_agents: no ssh alias -- H and S keys will stay dark."

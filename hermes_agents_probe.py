@@ -184,6 +184,34 @@ def _row_value(row: sqlite3.Row, column: str) -> Any:
         return None
 
 
+DISCORD_GUILD_IN_URL = re.compile(
+    r"(?:https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/"
+    r"|discord://(?:-/)?channels/)(\d+)"
+)
+
+
+def guild_id_from_discord_url(url: str) -> str:
+    """Extract the guild snowflake from a Discord https or discord:// URL."""
+    match = DISCORD_GUILD_IN_URL.search(str(url or ""))
+    return match.group(1) if match else ""
+
+
+def discord_jump_url(
+    guild_id: str, thread_id: str = "", chat_id: str = ""
+) -> str:
+    """Return a Discord https jump URL, or empty when the guild is unknown.
+
+    A thread id is preferred. Channel-level Hermes work has only ``chat_id``.
+    The URL is unusable without a real guild: Discord's ``@me`` form opens the
+    app but cannot land on a server thread.
+    """
+    guild = str(guild_id or "").strip()
+    target = str(thread_id or chat_id or "").strip()
+    if not guild or not target:
+        return ""
+    return f"https://discord.com/channels/{guild}/{target}"
+
+
 def _row_to_agent(row: sqlite3.Row, *, guild_id: str, now: float) -> dict[str, Any]:
     raw_source = str(row["source"] or "").strip().lower()
     source_tag = SOURCE_TAGS.get(raw_source, "hermes-ssh")
@@ -201,9 +229,7 @@ def _row_to_agent(row: sqlite3.Row, *, guild_id: str, now: float) -> dict[str, A
     # agent has no URL at all, so the connector focuses its terminal pane.
     url = ""
     if source_tag == "hermes-discord":
-        target = thread_id or chat_id
-        if target and guild_id:
-            url = f"https://discord.com/channels/{guild_id}/{target}"
+        url = discord_jump_url(guild_id, thread_id, chat_id)
     return {
         "name": short_label(row["title"], thread_id or session_id),
         "title": title,

@@ -222,6 +222,15 @@ def main() -> int:
               by_thread["4444444444444444444"]["url"] == "")
         check("a discord thread does have a jump URL",
               by_thread["2222222222222222222"]["url"].startswith("https://discord.com/"))
+        check("discord_jump_url needs a guild",
+              hermes_agents_probe.discord_jump_url("", "222") == "")
+        check("discord_jump_url prefers the thread over the channel",
+              hermes_agents_probe.discord_jump_url("111", "222", "333")
+              == "https://discord.com/channels/111/222")
+        check("discord:// launcher URLs expose their guild",
+              hermes_agents_probe.guild_id_from_discord_url(
+                  "discord://-/channels/1507988913527062618/1")
+              == "1507988913527062618")
 
         # Regression: the two bugs that put dead agents on the board.
         check("a session with no activity timestamp is excluded",

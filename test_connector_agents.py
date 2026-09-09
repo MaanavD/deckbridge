@@ -25,7 +25,8 @@ import connector_agents as connector_module  # noqa: E402
 
 from connector_agents import (  # noqa: E402
     AgentConnector, LocalLivenessProbe, SlotMap, agent_key, collapse_t3_shadows,
-    dedupe_labels, decay_stale, drop_uninteresting, face_for, normalize_status,
+    dedupe_labels, decay_stale, drop_uninteresting, face_for,
+    guild_id_from_discord_url, normalize_status,
     read_agents, read_launchers, read_shortcuts, launcher_face, workspace_identity,
     DEFAULT_LAUNCHERS, DEFAULT_SHORTCUTS, LAUNCHER_COLOR,
     SOURCE_BADGE, STALE_WORKING_S, STATUS_FACE, STATUS_ORDER, slot_priority,
@@ -1260,6 +1261,72 @@ def test_missing_and_corrupt_files() -> None:
               c._launcher_keys[7].get("bundle") == "T3 Code (Alpha)")
 
 
+def test_empty_discord_url_still_opens_the_thread() -> None:
+    """A working Hermes Discord key with no jump URL must still be clickable.
+
+    The remote probe only writes a URL when it is given a guild id. The Mac
+    watcher often starts without DISCORD_GUILD_ID, so live threads appear on
+    the deck with an empty url. Pressing one then runs focus_agent.sh
+    --url '' and Discord never moves. Recover the guild from the Hermes
+    launcher the operator already configured.
+    """
+    check("https Discord URLs expose their guild",
+          guild_id_from_discord_url(
+              "https://discord.com/channels/1507988913527062618/1")
+          == "1507988913527062618")
+    check("discord:// launcher URLs expose their guild",
+          guild_id_from_discord_url(
+              "discord://-/channels/1507988913527062618/1527613633180340236")
+          == "1507988913527062618")
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        write(root / "hermes.json", [{
+            "name": "Update clip",
+            "title": "Update clip selections, prompts, and descriptions",
+            "status": "working",
+            "source": "hermes-discord",
+            "thread_id": "1545901043475419207",
+            "session_id": "20260908_171532_3cf989f9",
+            "url": "",
+            "last_activity_at": now,
+        }])
+        apps = root / "apps.json"
+        apps.write_text(json.dumps({
+            "launchers": [{
+                "label": "Hermes",
+                "source": "hermes-discord",
+                "bundle": "Discord",
+                "url": "discord://-/channels/1507988913527062618/1527613633180340236",
+            }],
+        }), encoding="utf-8")
+        out = root / "pressed.txt"
+        c = AgentConnector(
+            claim=(0, 9),
+            hermes_state=root / "hermes.json",
+            local_state=root / "none.json",
+            apps_config=apps,
+            focus_cmd=f"printf '%s\\n' {{url}} >> {out}",
+        )
+        agents = c.collect(now)
+        check("a working Discord thread with no stored URL stays on the board",
+              len(agents) == 1 and agents[0]["status"] == "working",
+              str(agents))
+        check("collect reconstructs the Discord jump URL from the Hermes launcher",
+              agents[0].get("url") == (
+                  "https://discord.com/channels/"
+                  "1507988913527062618/1545901043475419207"
+              ),
+              str(agents[0].get("url")))
+        c.focus(agents[0])
+        check("pressing the key opens that reconstructed thread URL",
+              out.read_text(encoding="utf-8").strip() == (
+                  "https://discord.com/channels/"
+                  "1507988913527062618/1545901043475419207"
+              ),
+              out.read_text(encoding="utf-8") if out.exists() else "<missing>")
+
+
 def test_focus_command_receives_agent_fields() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "pressed.txt"
@@ -1771,6 +1838,7 @@ def main() -> int:
     test_viewing_a_finished_hermes_thread_settles_to_done()
     test_dismissals_survive_a_connector_restart()
     test_missing_and_corrupt_files()
+    test_empty_discord_url_still_opens_the_thread()
     test_focus_command_receives_agent_fields()
     test_tty_reaches_the_focus_command()
     test_herdr_pane_reaches_the_focus_command()

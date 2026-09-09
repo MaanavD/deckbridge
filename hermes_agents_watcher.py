@@ -29,12 +29,17 @@ from connection_runtime import (
     RetryPolicy,
     retry_delay_for_error,
 )
-from hermes_agents_probe import drop_liveness_probes
+from hermes_agents_probe import (
+    discord_jump_url,
+    drop_liveness_probes,
+    guild_id_from_discord_url,
+)
+from hermes_discord_watcher import fetch_remote_discord_config
 
 LOG = logging.getLogger("hermes_agents_watcher")
-DEFAULT_DB = "/home/hermes/.hermes/state.db"
+DEFAULT_DB = "/home/maanav/.hermes/state.db"
 DEFAULT_OUT = Path("~/.deckbridge/hermes_agents.json").expanduser()
-DEFAULT_REMOTE_PROBE = "/home/hermes/deckbridge/hermes_agents_probe.py"
+DEFAULT_REMOTE_PROBE = "/home/maanav/deckbridge/hermes_agents_probe.py"
 DEFAULT_INTERVAL = 5.0
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_GUILD_ID = ""
@@ -96,6 +101,79 @@ def build_command(args: argparse.Namespace) -> list[str]:
     ]
 
 
+def guild_id_from_apps_config(path: Path) -> str:
+    """Read a guild id from a Hermes launcher URL in apps.json."""
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("launchers", "apps", "shortcuts"):
+        raw = data.get(key)
+        if not isinstance(raw, list):
+            continue
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            guild = guild_id_from_discord_url(str(item.get("url") or ""))
+            if guild:
+                return guild
+    return ""
+
+
+def resolve_guild_id(args: argparse.Namespace) -> str:
+    """Return a guild id from flags, local config, or the remote Hermes env.
+
+    The probe will not write a Discord jump URL without a guild. Local
+    ``deckbridge.conf`` often omits ``DISCORD_GUILD_ID`` because the approval
+    watcher already reads it from the Hermes host. Prefer a local launcher
+    URL so a flaky extra SSH cannot leave working threads unclickable.
+    """
+    configured = str(getattr(args, "guild_id", "") or "").strip()
+    if configured:
+        return configured
+    env = str(os.environ.get("DISCORD_GUILD_ID") or "").strip()
+    if env:
+        return env
+    apps = getattr(args, "apps_config", None) or Path("~/.deckbridge/apps.json")
+    local = guild_id_from_apps_config(Path(apps))
+    if local:
+        return local
+    host = str(getattr(args, "ssh", "") or "").strip()
+    if not host:
+        return ""
+    try:
+        remote = fetch_remote_discord_config(
+            host, timeout=max(0.1, float(getattr(args, "timeout", 10.0)))
+        )
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return ""
+    return str(remote.get("DISCORD_GUILD_ID") or "").strip()
+
+
+def fill_discord_urls(document: dict[str, Any], guild_id: str) -> dict[str, Any]:
+    """Fill missing Discord jump URLs after a guild-less remote probe."""
+    guild = str(guild_id or "").strip()
+    if not guild:
+        return document
+    for item in document.get("agents", []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source") or "") != "hermes-discord":
+            continue
+        if str(item.get("url") or "").strip():
+            continue
+        url = discord_jump_url(
+            guild,
+            str(item.get("thread_id") or ""),
+            str(item.get("chat_id") or ""),
+        )
+        if url:
+            item["url"] = url
+    return document
+
+
 def annotate_ssh_host(document: dict[str, Any], ssh_host: str | None) -> dict[str, Any]:
     """Attach the Mac-side SSH alias needed to find a visible local viewer.
 
@@ -115,6 +193,8 @@ def annotate_ssh_host(document: dict[str, Any], ssh_host: str | None) -> dict[st
 
 def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     """Execute one probe and reject non-contract output or process failures."""
+    if not str(getattr(args, "guild_id", "") or "").strip():
+        args.guild_id = resolve_guild_id(args)
     command = build_command(args)
     try:
         completed = subprocess.run(
@@ -142,7 +222,10 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"probe returned invalid JSON: {exc}") from exc
     if not isinstance(document, dict) or not isinstance(document.get("agents"), list):
         raise ValueError("probe JSON must be an object with an agents list")
-    return drop_liveness_probes(annotate_ssh_host(document, args.ssh))
+    return fill_discord_urls(
+        drop_liveness_probes(annotate_ssh_host(document, args.ssh)),
+        str(args.guild_id or ""),
+    )
 
 
 def write_atomic(path: str | Path, document: dict[str, Any]) -> None:

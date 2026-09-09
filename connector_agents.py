@@ -64,6 +64,7 @@ from connection_runtime import (
 # emulator used to build `logos/<source>.svg` itself, which silently broke the
 # moment a source's mark became a PNG.
 import logos
+from hermes_agents_probe import discord_jump_url, guild_id_from_discord_url
 from app_badges import AppBadgeProvider
 
 log = logging.getLogger("connector_agents")
@@ -375,6 +376,39 @@ def _clean_label(text: str) -> str:
     return label.replace("_", " ").replace("-", " ").strip()
 
 
+def configured_discord_guild_id(apps_config: Path | None = None) -> str:
+    """Guild used to rebuild a Hermes jump URL when the probe omitted it."""
+    env = str(os.environ.get("DISCORD_GUILD_ID") or "").strip()
+    if env:
+        return env
+    if apps_config is None:
+        return ""
+    for group in (read_launchers(apps_config), read_shortcuts(apps_config)):
+        for item in group:
+            guild = guild_id_from_discord_url(item.get("url", ""))
+            if guild:
+                return guild
+    return ""
+
+
+def ensure_hermes_discord_url(
+    agent: dict[str, Any], guild_id: str
+) -> dict[str, Any]:
+    """Fill a missing Discord jump URL from thread/channel id plus guild."""
+    if str(agent.get("source") or "") != "hermes-discord":
+        return agent
+    if str(agent.get("url") or "").strip():
+        return agent
+    url = discord_jump_url(
+        str(guild_id or ""),
+        str(agent.get("thread_id") or ""),
+        str(agent.get("chat_id") or ""),
+    )
+    if url:
+        agent["url"] = url
+    return agent
+
+
 def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
     """Read one state file, returning [] for anything missing or malformed."""
     try:
@@ -416,6 +450,7 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
             "url": str(item.get("url") or ""),
             "web_url": str(item.get("web_url") or ""),
             "thread_id": str(item.get("thread_id") or ""),
+            "chat_id": str(item.get("chat_id") or ""),
             "session_id": str(item.get("session_id") or ""),
             "environment_id": str(item.get("environment_id") or ""),
             # For a remote terminal session this is the exact SSH alias used
@@ -1526,6 +1561,9 @@ class AgentConnector:
         # depend on local process/terminal handles. Only the local feed is
         # reconciled against the local OS.
         agents = read_agents(self.hermes_state, source_default="hermes-discord")
+        guild = configured_discord_guild_id(self.apps_config)
+        for agent in agents:
+            ensure_hermes_discord_url(agent, guild)
         try:
             agents = self.remote_herdr_resolver.enrich(agents)
         except Exception:
@@ -1828,6 +1866,7 @@ class AgentConnector:
 
     def focus(self, agent: dict[str, Any]) -> None:
         """Run the focus command for a pressed agent, never raising."""
+        ensure_hermes_discord_url(agent, configured_discord_guild_id(self.apps_config))
         try:
             command = self.focus_cmd.format(
                 name=shlex.quote(agent.get("name", "")),

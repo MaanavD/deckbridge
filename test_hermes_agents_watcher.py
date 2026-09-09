@@ -98,6 +98,85 @@ def main() -> int:
           len(routed.get("agents", [])) == 2
           and not routed["agents"][1].get("ssh_host"), str(routed))
 
+    # The probe will not invent a Discord URL without a guild id. When the
+    # Mac-side watcher is started without --guild-id (the common case: the
+    # token and guild live only on the Hermes host), it must recover the
+    # guild from the same remote .env the approval watcher already reads.
+    ssh_no_guild = watcher.parse_args(["--ssh", "hermes"])
+    check("an unconfigured SSH watcher does not yet invent a guild flag",
+          "--guild-id" not in watcher.build_command(ssh_no_guild),
+          " ".join(watcher.build_command(ssh_no_guild)))
+    resolve = getattr(watcher, "resolve_guild_id", None)
+    fill = getattr(watcher, "fill_discord_urls", None)
+    original_fetch = getattr(watcher, "fetch_remote_discord_config", None)
+    if resolve is not None:
+        watcher.fetch_remote_discord_config = (  # type: ignore[assignment]
+            lambda _host, **_kwargs: {"DISCORD_GUILD_ID": "1507988913527062618"}
+        )
+        ssh_no_guild.apps_config = Path("/no/such/apps.json")
+        try:
+            guild = resolve(ssh_no_guild)
+            ssh_no_guild.guild_id = guild
+            resolved_cmd = watcher.build_command(ssh_no_guild)
+        finally:
+            if original_fetch is None:
+                delattr(watcher, "fetch_remote_discord_config")
+            else:
+                watcher.fetch_remote_discord_config = original_fetch
+        check("SSH watcher discovers DISCORD_GUILD_ID from the remote Hermes env",
+              guild == "1507988913527062618", str(guild))
+        check("discovered guild is forwarded to the remote probe",
+              "--guild-id" in resolved_cmd
+              and resolved_cmd[resolved_cmd.index("--guild-id") + 1]
+              == "1507988913527062618",
+              " ".join(resolved_cmd))
+    else:
+        check("SSH watcher discovers DISCORD_GUILD_ID from the remote Hermes env",
+              False, "resolve_guild_id is missing")
+        check("discovered guild is forwarded to the remote probe", False)
+
+    apps_guild = getattr(watcher, "guild_id_from_apps_config", None)
+    if apps_guild is None:
+        check("watcher reads a guild from the Hermes launcher URL", False)
+    else:
+        with tempfile.TemporaryDirectory(prefix="deckbridge-guild-apps-") as tmp:
+            apps = Path(tmp) / "apps.json"
+            apps.write_text(
+                '{"launchers":[{"label":"Hermes","source":"hermes-discord",'
+                '"bundle":"Discord",'
+                '"url":"discord://-/channels/1507988913527062618/1"}]}',
+                encoding="utf-8",
+            )
+            check("watcher reads a guild from the Hermes launcher URL",
+                  apps_guild(apps) == "1507988913527062618",
+                  apps_guild(apps))
+
+    if fill is None:
+        check("watcher fills a missing Discord jump URL after a guild-less probe",
+              False, "fill_discord_urls is missing")
+        check("watcher never invents a Discord URL for an ssh-hosted agent", False)
+        check("watcher leaves an already-correct Discord URL alone", False)
+    else:
+        filled = fill(
+            {"agents": [
+                {"source": "hermes-discord", "thread_id": "1545901043475419207",
+                 "url": ""},
+                {"source": "hermes-ssh", "thread_id": "", "url": ""},
+                {"source": "hermes-discord", "thread_id": "1",
+                 "url": "https://discord.com/channels/already/1"},
+            ]},
+            "1507988913527062618",
+        )
+        check("watcher fills a missing Discord jump URL after a guild-less probe",
+              filled.get("agents", [{}])[0].get("url")
+              == "https://discord.com/channels/1507988913527062618/1545901043475419207",
+              str(filled))
+        check("watcher never invents a Discord URL for an ssh-hosted agent",
+              filled.get("agents", [{}, {}])[1].get("url") == "", str(filled))
+        check("watcher leaves an already-correct Discord URL alone",
+              filled.get("agents", [{}, {}, {}])[2].get("url")
+              == "https://discord.com/channels/already/1", str(filled))
+
     fake_log = FakeLog()
     original_log = watcher.LOG
     watcher.LOG = fake_log  # type: ignore[assignment]
