@@ -18,6 +18,9 @@ from pathlib import Path
 
 
 LABEL = "com.deckbridge.agent"
+# Earlier installs used this label. A leftover plist still starts at login
+# beside the current agent, and the two supervisors race for the Stream Deck.
+PREVIOUS_LABELS = ("com.maanav.deckbridge",)
 ROOT = Path(__file__).resolve().parent
 HOME = Path.home()
 UID = os.environ.get("DECKBRIDGE_UID", str(os.getuid()))
@@ -105,18 +108,46 @@ def wait_for_supervisor_release() -> tuple[bool, str]:
 
 
 def unload() -> tuple[bool, str]:
-    """Unload the active generation without guessing about launchctl errors.
+    """Unload current and leftover agents before waiting on the lifecycle lock.
 
-    `bootout` reports an error when a job is already absent, which is harmless,
-    but it can also fail while the job remains live.  Only the latter must stop
-    install/uninstall: replacing or deleting the runtime underneath that live
-    supervisor can strand its children and make the next bootstrap ambiguous.
+    A leftover previous-label job often sits waiting on that lock. Booting out
+    the current owner and then waiting lets the leftover acquire it, start
+    children, and look like cleanup never finished. Boot out every known label
+    first, leftover waiters included, then wait once.
     """
-    result = launchctl("bootout", TARGET)
-    if result.returncode == 0 or launchctl("print", TARGET).returncode != 0:
-        return wait_for_supervisor_release()
-    detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-    return False, detail
+    labels = (*PREVIOUS_LABELS, LABEL)
+    timeout = float(os.environ.get("DECKBRIDGE_UNLOAD_TIMEOUT", "10"))
+    interval = float(os.environ.get("DECKBRIDGE_UNLOAD_INTERVAL", "0.05"))
+    deadline = time.monotonic() + max(0.0, timeout)
+    last_error = ""
+
+    while True:
+        still_loaded = []
+        for label in labels:
+            target = f"{DOMAIN}/{label}"
+            result = launchctl("bootout", target)
+            if result.returncode == 0 or launchctl("print", target).returncode != 0:
+                continue
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            last_error = f"{label}: {detail}"
+            still_loaded.append(label)
+        if not still_loaded:
+            released, detail = wait_for_supervisor_release()
+            if released:
+                break
+            return False, detail
+        if time.monotonic() >= deadline:
+            return False, last_error or f"still loaded: {', '.join(still_loaded)}"
+        time.sleep(max(0.01, interval))
+
+    # install already wrote the current plist; only leftover labels may
+    # disappear here so a later bootstrap cannot load two supervisors.
+    for label in PREVIOUS_LABELS:
+        try:
+            (AGENTS_DIR / f"{label}.plist").unlink()
+        except FileNotFoundError:
+            pass
+    return True, ""
 
 
 def health(

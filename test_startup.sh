@@ -80,6 +80,12 @@ RUNTIME="$HOME/Library/Application Support/Deckbridge"
 PERSISTENT_RUN="$HOME/Library/Caches/Deckbridge/run"
 PERSISTENT_LOGS="$HOME/Library/Logs/Deckbridge"
 
+# A leftover LaunchAgent from the previous label starts at login beside the
+# current one. They share the USB device and pid directory, so a reboot leaves
+# the Stream Deck on the Elgato logo even though both jobs look "running".
+OLD_PLIST="$HOME/Library/LaunchAgents/com.maanav.deckbridge.plist"
+printf 'leftover\n' >"$OLD_PLIST"
+
 # Slice 1: install is one idempotent command that renders a complete LaunchAgent.
 install_out=$("$INSTALLER" install 2>&1)
 install_rc=$?
@@ -87,6 +93,10 @@ check "install succeeds" test "$install_rc" -eq 0
 check "install writes the per-user plist" test -f "$PLIST"
 check "install cuts over only after rendering by bootout/bootstrap" \
   grep -q "bootout gui/501/com.deckbridge.agent" "$FAKE_LAUNCHCTL_LOG"
+check "install retires the previous per-user LaunchAgent" \
+  grep -q "bootout gui/501/com.maanav.deckbridge" "$FAKE_LAUNCHCTL_LOG"
+check "install removes the previous LaunchAgent plist" \
+  test ! -e "$OLD_PLIST"
 check "install bootstraps the rendered plist" \
   grep -q "bootstrap gui/501 $PLIST" "$FAKE_LAUNCHCTL_LOG"
 
@@ -143,6 +153,9 @@ check "install retries launchctl's transient post-bootout error" \
 mkdir -p "$PERSISTENT_RUN/launchd-supervisor.lock"
 printf '%s\n' "$$" >"$PERSISTENT_RUN/launchd-supervisor.lock/pid"
 touch "$RUNTIME/old-supervisor-still-cleaning"
+printf 'leftover\n' >"$OLD_PLIST"
+previous_bootouts=$(grep -c "bootout gui/501/com.maanav.deckbridge" \
+  "$FAKE_LAUNCHCTL_LOG")
 overlap_out=$(DECKBRIDGE_UNLOAD_TIMEOUT=0.05 \
   "$INSTALLER" install 2>&1)
 overlap_rc=$?
@@ -150,6 +163,11 @@ check "install waits for the unloaded supervisor to release its lifecycle lock" 
   test "$overlap_rc" -ne 0
 check "install preserves runtime while the old supervisor is still cleaning" \
   test -e "$RUNTIME/old-supervisor-still-cleaning"
+check "install boots out leftover agents before waiting on the lock" \
+  awk -v before="$previous_bootouts" '
+    /bootout gui\/501\/com.maanav.deckbridge/ { count++ }
+    END { exit(count > before ? 0 : 1) }
+  ' "$FAKE_LAUNCHCTL_LOG"
 rm -f "$PERSISTENT_RUN/launchd-supervisor.lock/pid"
 rmdir "$PERSISTENT_RUN/launchd-supervisor.lock"
 

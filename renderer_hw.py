@@ -204,13 +204,22 @@ class HWRenderer:
             raise RuntimeError("no visual Stream Deck found")
         self.deck = visual[0]
         self.deck.open()
-        self.deck.reset()
-        self._display_suspended = self._session_locked()
-        self.deck.set_brightness(0 if self._display_suspended else self.brightness)
         self.key_size = self.deck.key_image_format()["size"]
         self._load_fonts()
+        self._display_suspended = self._session_locked()
+        # Feature reports (reset, brightness, serial) can fail on macOS while
+        # key image writes still work. Aborting here left the deck on the
+        # Elgato logo forever after a login race.
+        with suppress(Exception):
+            self.deck.reset()
+        with suppress(Exception):
+            self.deck.set_brightness(
+                0 if self._display_suspended else self.brightness)
+        serial = "?"
+        with suppress(Exception):
+            serial = self.deck.get_serial_number() or "?"
         print(f"[hw] opened {self.deck.deck_type()} "
-              f"serial={self.deck.get_serial_number()} keys={self.deck.key_count()} "
+              f"serial={serial} keys={self.deck.key_count()} "
               f"keysize={self.key_size}")
         return self.deck
 
@@ -225,10 +234,13 @@ class HWRenderer:
             return True
         with deck:
             if suspended:
-                deck.reset()
-                deck.set_brightness(0)
+                with suppress(Exception):
+                    deck.reset()
+                with suppress(Exception):
+                    deck.set_brightness(0)
             else:
-                deck.set_brightness(self.brightness)
+                with suppress(Exception):
+                    deck.set_brightness(self.brightness)
         if not suspended:
             # State may have changed while writes were suppressed. Repaint the
             # complete latest frame immediately instead of waiting for deckd.
@@ -253,6 +265,25 @@ class HWRenderer:
         if probe is not None and not probe():
             raise OSError("device disconnected")
 
+    def release_device(self) -> None:
+        """Drop the HID owner completely before enumerating again.
+
+        StreamDeck.close() does not stop the library reader thread. Closing
+        the handle while that thread is still in hid_read poisons hidapi for
+        the rest of this process, so every later feature report fails with -1
+        and the deck stays on the Elgato logo until launchd recycles us.
+        """
+        deck = self.deck
+        self.deck = None
+        if deck is None:
+            return
+        with suppress(Exception):
+            setup_reader = getattr(deck, "_setup_reader", None)
+            if setup_reader is not None:
+                setup_reader(None)
+        with suppress(Exception):
+            deck.close()
+
     def blank_and_close(self) -> None:
         """Leave no stale illuminated frame when the renderer exits."""
         if self.deck is None:
@@ -261,8 +292,7 @@ class HWRenderer:
             with self.deck:
                 self.deck.reset()
                 self.deck.set_brightness(0)
-        with suppress(Exception):
-            self.deck.close()
+        self.release_device()
 
     def _load_fonts(self):
         # Try a few common fonts; fall back to PIL default (still renders).
@@ -521,10 +551,7 @@ class HWRenderer:
                 # A partially opened backend must not keep the exclusive HID
                 # handle while we retry. Backends vary, so cleanup is bounded
                 # and best-effort; the next enumeration remains authoritative.
-                if self.deck is not None:
-                    with suppress(Exception):
-                        self.deck.close()
-                    self.deck = None
+                self.release_device()
                 print(f"[hw] Stream Deck unavailable ({exc}); retrying in "
                       f"{DEVICE_RETRY_SECONDS:g}s")
                 if self.health is not None:
@@ -547,10 +574,7 @@ class HWRenderer:
                 # connector stack) alive, release any partial handle, and go
                 # back to enumeration until the same or another deck appears.
                 self._ws = None
-                if self.deck is not None:
-                    with suppress(Exception):
-                        self.deck.close()
-                    self.deck = None
+                self.release_device()
                 print(f"[hw] Stream Deck connection lost ({exc}); waiting for device")
                 await asyncio.sleep(DEVICE_RETRY_SECONDS)
 

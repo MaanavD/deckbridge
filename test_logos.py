@@ -806,6 +806,100 @@ class TestHardwareRenderer(unittest.TestCase):
         self.assertEqual(attempts, 3)
         self.assertIs(deck.callback.__self__, r)
 
+    def test_failed_hid_open_stops_the_reader_before_close(self):
+        """A post-reset feature-report failure must not poison hidapi.
+
+        StreamDeck.close() leaves the library reader thread in hid_read.
+        Closing the handle under it makes every later retry fail with
+        'Failed to write feature report (-1)', so the deck stays on the
+        Elgato logo until the process is recycled.
+        """
+        r = self.renderer_hw.HWRenderer("ws://unused", 45)
+        events = []
+
+        class Deck:
+            def set_key_callback(self, callback):
+                self.callback = callback
+
+            def _setup_reader(self, callback):
+                events.append("stop_reader" if callback is None else "start_reader")
+
+            def close(self):
+                events.append("close")
+
+        attempts = 0
+
+        def flaky_then_open():
+            nonlocal attempts
+            attempts += 1
+            r.deck = Deck()
+            if attempts == 1:
+                raise OSError("Failed to write feature report (-1)")
+            return r.deck
+
+        async def no_connections():
+            if False:
+                yield None
+
+        r.open_device = flaky_then_open
+        r._reconnect = no_connections
+        with mock.patch.object(self.renderer_hw.asyncio, "sleep",
+                               mock.AsyncMock(return_value=None)):
+            asyncio.run(r.run())
+
+        self.assertGreaterEqual(attempts, 2)
+        self.assertEqual(events[:2], ["stop_reader", "close"])
+
+    def test_open_device_succeeds_when_feature_reports_fail(self):
+        """macOS hidapi can write key images while reset/brightness fail.
+
+        Aborting at reset() left the deck on the Elgato logo even though
+        set_key_image still worked.
+        """
+        try:
+            import StreamDeck.DeviceManager as sdm
+        except ImportError:
+            self.skipTest("streamdeck not installed")
+
+        class FakeDeck:
+            def is_visual(self):
+                return True
+
+            def open(self):
+                return None
+
+            def reset(self):
+                raise OSError("Failed to write feature report (-1)")
+
+            def set_brightness(self, _percent):
+                raise OSError("Failed to write feature report (-1)")
+
+            def key_image_format(self):
+                return {"size": (72, 72)}
+
+            def deck_type(self):
+                return "Stream Deck Original"
+
+            def get_serial_number(self):
+                raise OSError("Failed to read feature report (-1)")
+
+            def key_count(self):
+                return 15
+
+        fake = FakeDeck()
+
+        class FakeManager:
+            def enumerate(self):
+                return [fake]
+
+        r = self.renderer_hw.HWRenderer(
+            "ws://unused", 45, session_locked=lambda: False)
+        with mock.patch.object(sdm, "DeviceManager", FakeManager):
+            opened = r.open_device()
+
+        self.assertIs(opened, fake)
+        self.assertEqual(r.key_size, (72, 72))
+
     def test_renderer_reopens_after_the_deck_disconnects(self):
         """A USB unplug must not restart Discord and every other connector."""
         r = self.renderer_hw.HWRenderer("ws://unused", 45)
