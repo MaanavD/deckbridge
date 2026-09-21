@@ -90,6 +90,22 @@ def main() -> int:
         finally:
             watcher.poll_once = original_poll
 
+    with tempfile.TemporaryDirectory(prefix="deckbridge-discord-threads-") as tmp:
+        agents_path = Path(tmp) / "hermes_agents.json"
+        agents_path.write_text(json.dumps({
+            "agents": [
+                {"thread_id": "1549244444111405178", "source": "hermes-discord"},
+                {"thread_id": "1549244444111405178", "source": "hermes-discord"},
+                {"thread_id": "", "source": "hermes-ssh"},
+                {"name": "no thread"},
+            ],
+        }), encoding="utf-8")
+        check("agent feed yields unique Discord thread ids",
+              watcher.thread_ids_from_agents(agents_path)
+              == ["1549244444111405178"])
+        check("a missing agent feed yields no thread ids",
+              watcher.thread_ids_from_agents(Path(tmp) / "missing.json") == [])
+
     passed = sum(ok for _, ok in RESULTS)
     print(f"\n{passed}/{len(RESULTS)} passed")
     return 0 if RESULTS and passed == len(RESULTS) else 1

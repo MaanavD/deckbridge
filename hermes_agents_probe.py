@@ -188,12 +188,36 @@ DISCORD_GUILD_IN_URL = re.compile(
     r"(?:https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/"
     r"|discord://(?:-/)?channels/)(\d+)"
 )
+DISCORD_ROUTE_IN_URL = re.compile(
+    r"(?:https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/"
+    r"|discord://(?:-/)?channels/)(\d+|@me)/(\d+)"
+)
 
 
 def guild_id_from_discord_url(url: str) -> str:
     """Extract the guild snowflake from a Discord https or discord:// URL."""
     match = DISCORD_GUILD_IN_URL.search(str(url or ""))
     return match.group(1) if match else ""
+
+
+def discord_route_ids(url: str) -> tuple[str, str]:
+    """Return ``(guild, channel_or_thread)`` snowflakes from a jump URL.
+
+    ``discord://-/channels/...`` and ``https://discord.com/channels/...`` name
+    the same place. A trailing message id is ignored so a selected message
+    still acknowledges the channel.
+    """
+    match = DISCORD_ROUTE_IN_URL.search(str(url or ""))
+    if not match:
+        return "", ""
+    guild, target = match.group(1), match.group(2)
+    return ("" if guild == "@me" else guild), target
+
+
+def discord_url_in_text(text: str) -> str:
+    """Return the first Discord jump URL in ``text``, or empty."""
+    match = DISCORD_ROUTE_IN_URL.search(str(text or ""))
+    return match.group(0) if match else ""
 
 
 def discord_jump_url(

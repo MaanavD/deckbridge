@@ -892,6 +892,37 @@ def payload_session_id(payload: dict[str, Any], agent: str) -> str:
     return ""
 
 
+def cursor_shaped_payload(payload: dict[str, Any]) -> bool:
+    """True when stdin is a Cursor hook, not a Claude Code hook.
+
+    Current Cursor and T3 builds invoke every installed command hook, including
+    ``claude_shim.py``, and send their own payload: ``conversation_id``,
+    ``cursor_version``, and ``workspace_roots``, with no Claude ``cwd``. Treating
+    that as a Claude session created a key that appeared and vanished with the
+    Cursor turn and never named a real Claude conversation.
+    """
+    if payload.get("cursor_version") or payload.get("conversation_id"):
+        return True
+    roots = payload.get("workspace_roots")
+    return isinstance(roots, list) and not str(payload.get("cwd") or "").strip()
+
+
+def drop_session(
+    state: dict[str, Any], session_id: str, source: str,
+) -> dict[str, Any]:
+    """Remove one source's record for ``session_id``."""
+    if not session_id:
+        return state
+    agents = [
+        agent for agent in state.get("agents", [])
+        if not (str(agent.get("session_id") or "") == session_id
+                and str(agent.get("source") or "") == source)
+    ]
+    out = dict(state)
+    out["agents"] = agents
+    return out
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Translate a Claude Code, Codex CLI, or Cursor hook event into "
@@ -969,8 +1000,24 @@ def main(argv: list[str] | None = None) -> int:
     payload = read_stdin_json()
 
     event = args.event or payload.get("hook_event_name") or ""
-    cwd = args.cwd if args.cwd is not None else payload_cwd(payload, args.agent)
     session_id = payload_session_id(payload, args.agent)
+    if args.agent == "claude" and cursor_shaped_payload(payload):
+        # Cursor already has its own shim. Drop the shadow this payload used
+        # to leave behind, then leave every real Claude record alone.
+        state_path = Path(args.state).expanduser()
+        try:
+            with state_lock(state_path):
+                updated = drop_session(
+                    load_state(state_path), session_id, "claude-code",
+                )
+                write_atomic(state_path, updated)
+        except Exception as exc:  # never break the user's agent session
+            print(f"agent_shim[{args.agent}]: {exc}", file=sys.stderr)
+            return 0
+        if args.do_print:
+            print(json.dumps(updated, indent=2, sort_keys=True))
+        return 0
+    cwd = args.cwd if args.cwd is not None else payload_cwd(payload, args.agent)
     prefix = profile["prefix"] if args.prefix is None else args.prefix
     display_title = args.name or payload_title(payload, event)
     name = args.name or (prefix + (

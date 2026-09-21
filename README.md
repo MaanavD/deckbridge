@@ -24,7 +24,7 @@ tested without Stream Deck hardware.
   an app.
 - Reflows keys after sessions end or are dismissed.
 - Provides persistent launchers and app shortcuts when capacity allows.
-- Supports unread badges for Slack, Gmail, Discord, and Notion Calendar.
+- Supports unread badges for Slack, Discord, and Notion Calendar.
 - Uses the final key as press-and-hold dictation for the frontmost supported
   app.
 - Blanks the physical deck and sets its brightness to zero while macOS is
@@ -145,9 +145,9 @@ For a Hermes Discord launcher, set the URL in your private `apps.json`:
 }
 ```
 
-Any launcher or shortcut can be replaced without changing the source. Gmail
-can target an existing Chrome profile and opens a new tab in that profile's
-window.
+Any launcher or shortcut can be replaced without changing the source. A Chrome
+shortcut targets one profile: it focuses that profile's existing tab for the
+URL, and only opens a new tab in that profile's window when none is open.
 
 ## Hold-to-talk dictation
 

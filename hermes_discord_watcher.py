@@ -41,8 +41,14 @@ LOG = logging.getLogger("hermes_discord_watcher")
 DISCORD_API = "https://discord.com/api/v10"
 DISCORD_USER_AGENT = "DiscordBot (https://example.com, 1.0)"
 DEFAULT_STATE_PATH = Path("~/.deckbridge/hermes_approvals.json").expanduser()
+DEFAULT_AGENTS_PATH = Path("~/.deckbridge/hermes_agents.json").expanduser()
 APPROVAL_TITLE = "Command Approval Required"
+INPUT_TITLE = "needs your input"
 EXPIRED_MARKER = "Approval expired"
+# Forum/home-channel polls never see Tirith prompts; those live in the agent
+# thread. Cap extra scans so one poll cannot fan out across the whole guild.
+MAX_THREAD_SCANS = 12
+BUTTON_COMPONENT = 2
 REMOTE_ENV_KEYS = (
     "DISCORD_BOT_TOKEN",
     "DISCORD_HOME_CHANNEL",
@@ -206,6 +212,63 @@ def _created_ts(message: dict[str, Any]) -> float:
     return time.time()
 
 
+def _looks_like_blocker(title: str, body: str) -> bool:
+    """True for Tirith approval and input prompts, including emoji prefixes."""
+    blob = f"{title}\n{body}".casefold()
+    if EXPIRED_MARKER.casefold() in blob:
+        return False
+    return APPROVAL_TITLE.casefold() in blob or INPUT_TITLE in blob
+
+
+def _action_buttons(message: dict[str, Any]) -> list[dict[str, Any]]:
+    buttons: list[dict[str, Any]] = []
+    for row in message.get("components") or []:
+        if not isinstance(row, dict):
+            continue
+        for component in row.get("components") or []:
+            if not isinstance(component, dict):
+                continue
+            try:
+                ctype = int(component.get("type") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ctype == BUTTON_COMPONENT:
+                buttons.append(component)
+    return buttons
+
+
+def _still_waiting(message: dict[str, Any]) -> bool:
+    """Resolved Tirith prompts disable every button; open ones stay clickable.
+
+    Messages with no components keep the historical embed-only contract.
+    """
+    buttons = _action_buttons(message)
+    if not buttons:
+        return True
+    return any(not button.get("disabled") for button in buttons)
+
+
+def thread_ids_from_agents(path: str | Path) -> list[str]:
+    """Return Discord thread snowflakes published by the Hermes agent probe."""
+    try:
+        document = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    raw = document.get("agents") if isinstance(document, dict) else None
+    if not isinstance(raw, list):
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        thread = str(item.get("thread_id") or "").strip()
+        if thread.isdigit() and thread not in seen:
+            seen.add(thread)
+            found.append(thread)
+    return found
+
+
 def approval_from_message(
     message: dict[str, Any], *, channel_id: str, guild_id: str | None = None
 ) -> dict[str, Any] | None:
@@ -213,16 +276,18 @@ def approval_from_message(
     channel_id = str(channel_id)
     configured_guild = str(guild_id or os.environ.get("DISCORD_GUILD_ID", ""))
     message_id = str(message.get("id", ""))
-    if not message_id:
+    if not message_id or not _still_waiting(message):
         return None
-    for embed in message.get("embeds", []) or []:
-        if not isinstance(embed, dict) or embed.get("title") != APPROVAL_TITLE:
-            continue
+    embeds = [item for item in (message.get("embeds") or []) if isinstance(item, dict)]
+    if not embeds and _looks_like_blocker("", str(message.get("content") or "")):
+        embeds = [{"title": "", "description": str(message.get("content") or "")}]
+    for embed in embeds:
+        title = str(embed.get("title") or "")
         body = _embed_text(embed)
-        if EXPIRED_MARKER in body:
+        if not _looks_like_blocker(title, body):
             continue
 
-        description = str(embed.get("description", ""))
+        description = str(embed.get("description") or "")
         command = _field_value(embed, "Requested command")
         if not command:
             command = _description_value(description, "Requested command", "Reason")
@@ -278,12 +343,25 @@ def write_state(path: str | Path, pending: list[dict[str, Any]]) -> None:
             pass
 
 
+def _merge_pending(
+    pending: list[dict[str, Any]], records: list[dict[str, Any]],
+) -> None:
+    seen = {str(item.get("message_id") or "") for item in pending}
+    for record in records:
+        message_id = str(record.get("message_id") or "")
+        if not message_id or message_id in seen:
+            continue
+        seen.add(message_id)
+        pending.append(record)
+
+
 def poll_once(
     token: str,
     channel_id: str,
     *,
     state_path: str | Path = DEFAULT_STATE_PATH,
     guild_id: str | None = None,
+    extra_channel_ids: Iterable[str] = (),
     limit: int = 50,
     timeout: float = 20.0,
 ) -> list[dict[str, Any]]:
@@ -296,6 +374,40 @@ def poll_once(
     pending = collect_pending(
         messages, channel_id=channel_id, guild_id=resolved_guild_id
     )
+    home = str(channel_id)
+    # Forum home-channel messages are thread starters. Tirith prompts are
+    # posted inside those threads, never as the starter itself.
+    home_threads = [
+        str(item.get("id") or "") for item in messages
+        if str(item.get("id") or "").isdigit()
+    ]
+    extras: list[str] = []
+    for extra in list(extra_channel_ids) + home_threads:
+        thread = str(extra or "").strip()
+        if not thread or thread == home or thread in extras:
+            continue
+        extras.append(thread)
+        if len(extras) >= MAX_THREAD_SCANS:
+            break
+    for thread in extras:
+        try:
+            thread_messages = fetch_messages(
+                token, thread, limit=limit, timeout=timeout
+            )
+        except HTTPError as exc:
+            if exc.code in (403, 404):
+                continue
+            raise
+        except (URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            LOG.warning("Discord thread %s poll failed: %s", thread, exc)
+            continue
+        _merge_pending(
+            pending,
+            collect_pending(
+                thread_messages, channel_id=thread, guild_id=resolved_guild_id
+            ),
+        )
+    pending.sort(key=lambda item: float(item.get("created_ts") or 0))
     write_state(state_path, pending)
     return pending
 
@@ -343,6 +455,7 @@ def run_watcher(
     once: bool = False,
     reporter: HealthReporter | None = None,
     credential_loader: Callable[[], dict[str, str]] | None = None,
+    agents_state: str | Path | None = None,
 ) -> None:
     # Credentials may come from the local environment or a retryable remote
     # adapter.  The latter keeps the token in memory only while allowing an
@@ -392,6 +505,9 @@ def run_watcher(
                 channel_value,
                 state_path=state_path,
                 guild_id=resolved_guild_id,
+                extra_channel_ids=thread_ids_from_agents(
+                    agents_state or DEFAULT_AGENTS_PATH
+                ),
                 limit=limit,
                 timeout=timeout,
             )
@@ -438,6 +554,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--state-file", type=Path, default=DEFAULT_STATE_PATH)
     parser.add_argument(
+        "--agents-file", type=Path, default=DEFAULT_AGENTS_PATH,
+        help="Hermes agent feed whose Discord thread ids are scanned for Tirith prompts",
+    )
+    parser.add_argument(
         "--health-file", type=Path, default=None,
         help="connection health output (default: $DECKBRIDGE_HEALTH_DIR/discord_watcher.json)",
     )
@@ -477,6 +597,7 @@ def main(argv: list[str] | None = None) -> None:
         once=args.once,
         reporter=reporter,
         credential_loader=loader,
+        agents_state=args.agents_file,
     )
 
 

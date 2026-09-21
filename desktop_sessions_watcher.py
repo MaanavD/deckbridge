@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Iterable
+from hermes_agents_probe import discord_route_ids, discord_url_in_text
 
 
 DEFAULT_STATE = "~/.deckbridge/desktop_agents.json"
@@ -27,9 +27,19 @@ DEFAULT_HELPER = str(Path(__file__).with_name("mic_key.sh"))
 POLL_SECONDS = 2.0
 HAMMERSPOON_CLI = "/opt/homebrew/bin/hs"
 HAMMERSPOON_EXPR = "return deckbridgeClaudeSnapshot()"
+DISCORD_HS_EXPR = "return deckbridgeDiscordSnapshot()"
 DISCORD_BUNDLE = "com.hnc.Discord"
 T3CODE_BUNDLE = "com.t3tools.t3code"
 CURSOR_STATE_DB = "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
+# Claude Desktop's Code and Cowork tabs write these files. Current releases
+# (Claude Code 2.1.27x local-agent, and the desktop app's empty accessibility
+# tree) do not deliver the chat URL or the user hook, so the files are the
+# session list. Older history stays out of the deck.
+CLAUDE_SESSION_ROOTS = (
+    "~/Library/Application Support/Claude/claude-code-sessions",
+    "~/Library/Application Support/Claude/local-agent-mode-sessions",
+)
+CLAUDE_SESSION_MAX_AGE_S = 6 * 3600.0
 
 # bundle id, Deckbridge source, focus app, accepted deep-link URL prefixes
 SURFACES = (
@@ -153,6 +163,133 @@ def parse_hammerspoon_snapshot(text: str, now: float) -> list[dict[str, object]]
     return records
 
 
+def epoch_seconds(value: object) -> float:
+    """Accept Claude's millisecond timestamps and ordinary epoch seconds."""
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if number > 10_000_000_000:
+        number /= 1000.0
+    return number
+
+
+def claude_session_target(document: dict[str, object]) -> tuple[str, str]:
+    """Return ``(session_id, url)`` for one Claude Desktop session file.
+
+    A ``local_`` id is a Code session and opens ``/epitaxy/local_…``. A
+    scheduled run is a Chat sidebar item, and that same id opens Code and
+    reports the session missing. Chat addresses the task by its slug at
+    ``/scheduled-task/<id>``.
+    """
+    session_id = str(document.get("sessionId") or "").strip()
+    task_id = str(document.get("scheduledTaskId") or "").strip()
+    kind = str(document.get("sessionType") or "").strip().lower()
+    if (kind == "scheduled" and task_id
+            and all(char.isalnum() or char in "-_" for char in task_id)):
+        return task_id, f"claude://claude.ai/scheduled-task/{task_id}"
+    if session_id.startswith("local_"):
+        return session_id, f"claude://claude.ai/epitaxy/{session_id}"
+    return session_id, f"claude://claude.ai/chat/{session_id}"
+
+
+def _usable_cwd(value: object) -> str:
+    path = str(value or "").strip()
+    if "/Library/Application Support/Claude/" in path:
+        return ""
+    return path
+
+
+def parse_claude_session_document(
+    document: dict[str, object], now: float, alive: bool,
+    max_age_s: float = CLAUDE_SESSION_MAX_AGE_S,
+) -> dict[str, object] | None:
+    """Turn one Claude Desktop session file into a deck record."""
+    if not isinstance(document, dict) or document.get("isArchived"):
+        return None
+    session_id = str(document.get("sessionId") or "").strip()
+    if not session_id:
+        return None
+    activity = epoch_seconds(
+        document.get("lastActivityAt") or document.get("lastFocusedAt")
+        or document.get("createdAt")
+    )
+    if not alive and (not activity or now - activity > max_age_s):
+        return None
+    route_id, url = claude_session_target(document)
+    if not route_id:
+        return None
+    cwd = _usable_cwd(document.get("originCwd") or document.get("cwd"))
+    title = compact_title(str(document.get("title") or ""), "Claude")
+    return {
+        "name": title,
+        "display_title": title,
+        "status": "working" if alive else "done",
+        "source": "claude-desktop",
+        "session_id": route_id,
+        "cli_session_id": str(document.get("cliSessionId") or ""),
+        "app": "Claude",
+        "window": "",
+        "url": url,
+        "cwd": cwd,
+        "updated_at": activity or now,
+        "desktop_surface": True,
+        "exact_route": True,
+    }
+
+
+def live_command_lines() -> str:
+    """One snapshot of process command lines, used to see a live CLI session."""
+    try:
+        result = subprocess.run(
+            ["ps", "-ax", "-o", "command="], capture_output=True, text=True,
+            timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
+def scan_claude_session_files(
+    now: float, roots: list[Path] | None = None,
+    command_lines: str | None = None,
+) -> list[dict[str, object]]:
+    """Publish recent Claude Desktop Code and Cowork sessions."""
+    if roots is None:
+        roots = [Path(path).expanduser() for path in CLAUDE_SESSION_ROOTS]
+    if command_lines is None:
+        command_lines = live_command_lines()
+    records: list[dict[str, object]] = []
+    by_id: dict[str, dict[str, object]] = {}
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("local_*.json"):
+            try:
+                document = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(document, dict):
+                continue
+            cli_id = str(document.get("cliSessionId") or "")
+            alive = bool(cli_id) and cli_id in command_lines
+            record = parse_claude_session_document(document, now, alive)
+            if record is None:
+                continue
+            session_id = str(record["session_id"])
+            prior = by_id.get(session_id)
+            if prior is not None and float(prior.get("updated_at") or 0) >= float(
+                record.get("updated_at") or 0
+            ):
+                continue
+            by_id[session_id] = record
+            if prior is None:
+                records.append(record)
+            else:
+                records[records.index(prior)] = record
+    return records
+
+
 def scan_hammerspoon(now: float) -> list[dict[str, object]]:
     cli = os.environ.get("DECKBRIDGE_HS_CLI", HAMMERSPOON_CLI)
     if not os.path.isfile(cli):
@@ -165,6 +302,38 @@ def scan_hammerspoon(now: float) -> list[dict[str, object]]:
     except (OSError, subprocess.SubprocessError):
         return []
     return parse_hammerspoon_snapshot(result.stdout, now) if result.returncode == 0 else []
+
+
+def _discord_url_from_hammerspoon() -> str:
+    """Read Discord's selected channel through Hammerspoon's AX grant.
+
+    Launchd is a different TCC parent than Terminal. Deckbridge Mic can
+    return the URL interactively and still fail as "not trusted" from the
+    watcher; Claude already uses this Hammerspoon path for the same reason.
+    """
+    cli = os.environ.get("DECKBRIDGE_HS_CLI", HAMMERSPOON_CLI)
+    if not os.path.isfile(cli):
+        return ""
+    try:
+        result = subprocess.run(
+            [cli, "-c", DISCORD_HS_EXPR], capture_output=True, text=True,
+            timeout=3, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return discord_url_in_text(result.stdout or "")
+    text = result.stdout or ""
+    try:
+        start = text.find("{")
+        document = json.loads(text[start:] if start >= 0 else text)
+    except (TypeError, ValueError):
+        return discord_url_in_text(text)
+    if isinstance(document, dict):
+        url = str(document.get("url") or "")
+        if discord_route_ids(url)[1]:
+            return url
+    return discord_url_in_text(text)
 
 
 def write_state(
@@ -238,6 +407,16 @@ def scan(helper: str, now: float | None = None) -> list[dict[str, object]]:
     if claude:
         agents = [a for a in agents if a.get("source") != "claude-desktop"]
         agents.extend(claude)
+    # Accessibility used to be enough. Current Claude builds expose neither the
+    # chat URL nor a user hook for Cowork, so session files fill that gap.
+    # A route Hammerspoon already named keeps its live status.
+    known = {
+        str(agent.get("session_id") or "")
+        for agent in agents if agent.get("source") == "claude-desktop"
+    }
+    for record in scan_claude_session_files(current):
+        if str(record.get("session_id") or "") not in known:
+            agents.append(record)
     return agents
 
 
@@ -280,16 +459,25 @@ def scan_viewed(
     """Return exact surfaces the user currently has in front of them."""
     front = _run([helper, "--helper-frontmost"])
     parts = front.split("|", 2)
-    if len(parts) < 2:
-        return []
-    app, bundle = parts[0], parts[1]
+    app, bundle = (parts[0], parts[1]) if len(parts) >= 2 else ("", "")
     viewed: list[dict[str, object]] = []
+
+    # Hermes Discord keys already exist from the remote probe. The selected
+    # Discord channel is the view of that thread even after the operator
+    # returns to another app; requiring Discord to stay frontmost left every
+    # finished channel as NEEDS YOU.
+    discord_url = _run([helper, "--helper-web-url", DISCORD_BUNDLE], timeout=3.0)
+    if not discord_route_ids(discord_url)[1]:
+        discord_url = _discord_url_from_hammerspoon()
+    if discord_route_ids(discord_url)[1]:
+        viewed.append({"source": "hermes-discord", "url": discord_url})
+
+    if len(parts) < 2:
+        return [view for view in viewed if any(str(value) for value in view.values())]
 
     surface = next((item for item in SURFACES if item[0] == bundle), None)
     if bundle == DISCORD_BUNDLE:
-        url = _run([helper, "--helper-web-url", bundle], timeout=3.0)
-        if url:
-            viewed.append({"source": "hermes-discord", "url": url})
+        pass
     elif bundle == T3CODE_BUNDLE:
         url = _run([helper, "--helper-web-url", bundle], timeout=3.0)
         session = t3code_thread_id(url)
@@ -304,6 +492,10 @@ def scan_viewed(
             # Safe only when the connector sees one non-generic live session
             # hosted by this app. It performs that uniqueness check globally.
             viewed.append({"app": surface[2], "unique_app": "1"})
+    else:
+        url = _run([helper, "--helper-web-url", bundle], timeout=3.0)
+        if discord_route_ids(url)[1]:
+            viewed.append({"source": "hermes-discord", "url": url})
 
     if bundle == SURFACES[0][0]:
         for agent in agents:

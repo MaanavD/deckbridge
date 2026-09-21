@@ -98,6 +98,45 @@ function deckbridgeClaudeSnapshot()
     return json.encode({sessions = sessions})
 end
 
+local function discordUrlIn(element, depth, visited)
+    if not element or depth > 40 or visited[1] >= 8000 then return "" end
+    visited[1] = visited[1] + 1
+    local rawUrl = element:attributeValue("AXURL")
+    local url = clean(type(rawUrl) == "table" and rawUrl.url or rawUrl)
+    if url:find("discord.com/channels/", 1, true)
+            or url:find("discordapp.com/channels/", 1, true)
+            or startsWith(url, "discord://") then
+        return url
+    end
+    for _, child in ipairs(element:attributeValue("AXChildren") or {}) do
+        local found = discordUrlIn(child, depth + 1, visited)
+        if found ~= "" then return found end
+    end
+    return ""
+end
+
+-- LaunchAgent children are a different TCC parent than Terminal. Deckbridge
+-- Mic can read Discord's selected channel interactively and still return
+-- "not trusted" from the watcher. Hammerspoon already has the durable grant
+-- used for Claude snapshots.
+function deckbridgeDiscordSnapshot()
+    local app = hs.application.get("com.hnc.Discord") or hs.application.get("Discord")
+    if not app then return json.encode({url = ""}) end
+    local axApp = hs.axuielement.applicationElement(app)
+    local focused = axApp and axApp:attributeValue("AXFocusedWindow") or nil
+    local windows = axApp and axApp:attributeValue("AXWindows") or {}
+    local order = {}
+    if focused then table.insert(order, focused) end
+    for _, window in ipairs(windows or {}) do
+        if window ~= focused then table.insert(order, window) end
+    end
+    for _, window in ipairs(order) do
+        local url = discordUrlIn(window, 0, {0})
+        if url ~= "" then return json.encode({url = url}) end
+    end
+    return json.encode({url = ""})
+end
+
 -- Select a T3 thread inside Hammerspoon's durable Accessibility identity.
 -- macOS can deny a separately trusted helper when launchd is its responsible
 -- parent, even though the same binary succeeds from Terminal. The hs CLI is

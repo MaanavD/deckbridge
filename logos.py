@@ -89,6 +89,7 @@ SOURCE_LOGO = {
     "google-chrome": "google-chrome.svg",
     "discord": "discord.svg",
     "notion-calendar": "notion-calendar.svg",
+    "command-board": "command-board.svg",
 }
 
 # Fixed app shortcuts use the installed applications' own icon resources on
@@ -130,6 +131,7 @@ BADGE_LETTER = {
     "gmail": "W",
     "google-chrome": "P",
     "notion-calendar": "N",
+    "command-board": "B",
 }
 
 

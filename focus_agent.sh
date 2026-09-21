@@ -1635,6 +1635,19 @@ cursor_agent_focus() {
 # the hook positively identified as desktop-hosted (it recorded that app), and
 # only when the id looks like that app's own id. Everything else keeps the old
 # behaviour of activating the app, which is honest about being approximate.
+# Chat's Scheduled list is not a Code session. The recorded URL is the
+# exact sidebar route; rebuilding it from a local_ id opens Code and reports
+# the session missing.
+recorded_claude_url() {
+  case "$URL" in
+    claude://claude.ai/scheduled-task/*[!/?]*)
+      printf '%s\n' "$URL"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 deep_link_for_agent() {
   local app=$1 id=$2 h4 h8 h12 uuid_id
   [ -n "$id" ] || return 1
@@ -1981,6 +1994,7 @@ selected_url_matches_session() {
   case "$app:$id:$clean" in
     Claude:local_*:*/epitaxy/local_*) return 0 ;;
     Claude:*:*/chat/*) return 0 ;;
+    Claude:*:*/scheduled-task/*) return 0 ;;
     ChatGPT:*:*/local/*|ChatGPT:*:*/threads/*) return 0 ;;
     *) return 1 ;;
   esac
@@ -1999,7 +2013,11 @@ app_focus_deep() {
   if [ "$APP_HINT" = Claude ] && [ "$SOURCE" = claude-code ]; then
     case "$route_id" in local_*) ;; *) route_id=local_$route_id ;; esac
   fi
-  url=$(deep_link_for_agent "$APP_HINT" "$route_id") || return 2
+  if [ "$APP_HINT" = Claude ] && url=$(recorded_claude_url); then
+    route_id=${url##*/}
+  else
+    url=$(deep_link_for_agent "$APP_HINT" "$route_id") || return 2
+  fi
   if ! app_is_running "$APP_HINT"; then
     error "not focusing $APP_HINT: it is not running (the recorded session is unavailable)"
     return 1

@@ -13,10 +13,10 @@
   "shortcuts": [
     {"label": "Slack", "source": "slack", "bundle": "Slack"},
     {
-      "label": "Gmail",
-      "source": "gmail",
+      "label": "Command Board",
+      "source": "command-board",
       "bundle": "Google Chrome",
-      "url": "https://mail.google.com/mail/u/0/",
+      "url": "https://app.notion.com/p/8bf47822e6014b40a9e7a081e741f321?v=39ac370222d581018fb0000c4b1137d3&pvs=32",
       "profile": "Default"
     },
     {"label": "Discord", "source": "discord", "bundle": "Discord"},

@@ -64,7 +64,10 @@ from connection_runtime import (
 # emulator used to build `logos/<source>.svg` itself, which silently broke the
 # moment a source's mark became a PNG.
 import logos
-from hermes_agents_probe import discord_jump_url, guild_id_from_discord_url
+from hermes_agents_probe import (
+    discord_jump_url, discord_route_ids, guild_id_from_discord_url,
+    short_label,
+)
 from app_badges import AppBadgeProvider
 
 log = logging.getLogger("connector_agents")
@@ -205,11 +208,19 @@ DEFAULT_LAUNCHERS = [
         "sublabel": "new session",
     },
 ]
+#: The work key opens the Notion command board in the work Chrome profile.
+#: It replaced Gmail: the inbox is where work arrives, the board is where work
+#: is decided, and only one of those is worth a dedicated key.
+COMMAND_BOARD_URL = (
+    "https://app.notion.com/p/8bf47822e6014b40a9e7a081e741f321"
+    "?v=39ac370222d581018fb0000c4b1137d3&pvs=32"
+)
 DEFAULT_SHORTCUTS = [
     {"label": "Slack", "source": "slack", "bundle": "Slack"},
     {
-        "label": "Gmail", "source": "gmail", "bundle": "Google Chrome",
-        "url": "https://mail.google.com/mail/u/0/", "profile": "Default",
+        "label": "Command Board", "source": "command-board",
+        "bundle": "Google Chrome",
+        "url": COMMAND_BOARD_URL, "profile": "Default",
     },
     {"label": "Discord", "source": "discord", "bundle": "Discord"},
     {
@@ -257,6 +268,7 @@ SOURCE_BADGE = {
     "google-chrome": "P",
     "discord": "D",
     "notion-calendar": "N",
+    "command-board": "B",
 }
 
 #: Human-readable status text for the key's second line.
@@ -452,6 +464,7 @@ def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
             "thread_id": str(item.get("thread_id") or ""),
             "chat_id": str(item.get("chat_id") or ""),
             "session_id": str(item.get("session_id") or ""),
+            "cli_session_id": str(item.get("cli_session_id") or ""),
             "environment_id": str(item.get("environment_id") or ""),
             # For a remote terminal session this is the exact SSH alias used
             # by the local watcher. It lets the Mac map the remote DB record to
@@ -551,6 +564,41 @@ def collapse_t3_shadows(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def collapse_claude_desktop_shadows(
+    agents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep the desktop session when a hook is watching the same CLI id.
+
+    Claude Desktop's Code tab used to report through the CLI hook. Current
+    releases often skip that hook, so the desktop watcher reads the session
+    file. When an older release still fires the hook too, the two records are
+    one conversation: the desktop record owns the deep link, and a blocked
+    hook status is the stronger attention signal.
+    """
+    desktop = {
+        str(agent.get("cli_session_id") or ""): agent
+        for agent in agents
+        if str(agent.get("source") or "") == "claude-desktop"
+        and str(agent.get("cli_session_id") or "")
+    }
+    if not desktop:
+        return agents
+    out: list[dict[str, Any]] = []
+    for agent in agents:
+        if str(agent.get("source") or "") != "claude-code":
+            out.append(agent)
+            continue
+        owner = desktop.get(str(agent.get("session_id") or ""))
+        if owner is None:
+            out.append(agent)
+            continue
+        if agent.get("status") == "blocked":
+            owner["status"] = "blocked"
+        elif agent.get("status") == "working" and owner.get("status") != "blocked":
+            owner["status"] = "working"
+    return out
+
+
 def read_viewed(path: Path) -> list[dict[str, str]]:
     """Read exact, ephemeral surface identities selected outside the deck."""
     try:
@@ -568,6 +616,77 @@ def read_viewed(path: Path) -> list[dict[str, str]]:
     ]
 
 
+def read_pending_approvals(path: Path) -> list[dict[str, Any]]:
+    """Read Tirith prompts published by the Discord approval watcher."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    raw = data.get("pending") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _approval_thread_id(item: dict[str, Any]) -> str:
+    channel = str(item.get("channel_id") or "").strip()
+    if channel.isdigit():
+        return channel
+    _, target = discord_route_ids(str(item.get("url") or ""))
+    return target
+
+
+def apply_discord_approvals(
+    agents: list[dict[str, Any]], pending: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Promote matching Discord threads to blocked while a Tirith prompt waits.
+
+    Hermes session status is a heartbeat, not an approval feed. A finished
+    thread can still be sitting on Allow/Deny; that wait is the thing the
+    operator has not handled.
+    """
+    if not pending:
+        return agents
+    claimed: set[str] = set()
+    for agent in agents:
+        thread = str(agent.get("thread_id") or "").strip()
+        if not thread:
+            _, thread = discord_route_ids(str(agent.get("url") or ""))
+        if not thread or str(agent.get("source") or "") != "hermes-discord":
+            continue
+        matches = [
+            item for item in pending if _approval_thread_id(item) == thread
+        ]
+        if not matches:
+            continue
+        newest = max(matches, key=lambda item: float(item.get("created_ts") or 0))
+        agent["status"] = "blocked"
+        url = str(newest.get("url") or "")
+        if url:
+            agent["url"] = url
+        stamp = float(newest.get("created_ts") or 0.0)
+        if stamp > float(agent.get("updated_at") or 0.0):
+            agent["updated_at"] = stamp
+        claimed.add(thread)
+    for item in pending:
+        thread = _approval_thread_id(item)
+        if not thread or thread in claimed:
+            continue
+        claimed.add(thread)
+        command = " ".join(str(item.get("command") or "").split())
+        agents.append({
+            "name": short_label(command, thread) if command else "Approval",
+            "title": command or "Command Approval Required",
+            "status": "blocked",
+            "source": "hermes-discord",
+            "thread_id": thread,
+            "session_id": str(item.get("message_id") or ""),
+            "url": str(item.get("url") or ""),
+            "updated_at": float(item.get("created_ts") or 0.0),
+        })
+    return agents
+
+
 def manual_view_matches(
     agent: dict[str, Any], view: dict[str, str], agents: list[dict[str, Any]],
 ) -> bool:
@@ -581,6 +700,15 @@ def manual_view_matches(
             return selected == str(agent.get(field) or "")
     selected_url = view.get("url", "").rstrip("/")
     agent_url = str(agent.get("url") or "").rstrip("/")
+    _, selected_target = discord_route_ids(selected_url)
+    if selected_target:
+        _, agent_target = discord_route_ids(agent_url)
+        if selected_target in {
+            agent_target,
+            str(agent.get("thread_id") or ""),
+            str(agent.get("chat_id") or ""),
+        }:
+            return True
     if selected_url and agent_url:
         # Discord may append a selected message id after the thread/channel.
         return selected_url == agent_url or selected_url.startswith(agent_url + "/")
@@ -1272,6 +1400,22 @@ def chrome_titles_refer_to_same_window(chrome_title: str, os_title: str) -> bool
     return False
 
 
+#: A Notion page keeps one 32-hex id and rewrites everything around it: the
+#: same board is app.notion.com/p/<id>, www.notion.so/<slug>-<id>, and carries
+#: whichever ?v= and ?pvs= the last visit left behind. Matching the URL as a
+#: prefix therefore fails on the second press and opens the board again.
+_PAGE_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def chrome_tab_match_token(url: str) -> str:
+    """Return the substring that still identifies ``url`` after a rewrite."""
+    # Query string excluded: ?v= is a view id of the same shape, and matching
+    # that would call any view of the database the same page.
+    path = str(url or "").lower().split("?", 1)[0]
+    found = _PAGE_ID_RE.findall(path)
+    return found[-1] if found else ""
+
+
 def chrome_tab_matches_url(tab_url: str, target: str) -> bool:
     """True when an open tab is the destination, including Gmail hash routes."""
     tab = str(tab_url or "").strip()
@@ -1285,6 +1429,9 @@ def chrome_tab_matches_url(tab_url: str, target: str) -> bool:
     if tab_base == want_base or tab_base.startswith(want_base + "/"):
         return True
     if "mail.google.com/mail" in want and "mail.google.com/mail" in tab:
+        return True
+    token = chrome_tab_match_token(want)
+    if token and token in tab.lower():
         return True
     return False
 
@@ -1317,6 +1464,7 @@ _CHROME_TAB_SCRIPT = r'''
 on run argv
     set profileName to item 1 of argv
     set targetUrl to item 2 of argv
+    set matchToken to item 3 of argv
     set profileSuffix to " - Google Chrome - " & profileName
     set profileParen to " (" & profileName & ")"
     tell application "System Events"
@@ -1360,6 +1508,7 @@ on run argv
                     set matched to false
                     if tabUrl starts with targetUrl then set matched to true
                     if targetUrl contains "mail.google.com" and tabUrl contains "mail.google.com/mail" then set matched to true
+                    if matchToken is not "" and tabUrl contains matchToken then set matched to true
                     if matched then
                         if isProfile then
                             set active tab index of w to tabIndex
@@ -1443,7 +1592,8 @@ def open_or_focus_chrome_tab(profile_name: str, url: str) -> bool:
         return False
     try:
         result = subprocess.run(
-            ["/usr/bin/osascript", "-e", _CHROME_TAB_SCRIPT, name, target],
+            ["/usr/bin/osascript", "-e", _CHROME_TAB_SCRIPT, name, target,
+             chrome_tab_match_token(target)],
             check=False, capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -1478,6 +1628,7 @@ class AgentConnector:
         remote_herdr_resolver: Any | None = None,
         badge_provider: Any | None = None,
         ack_state: str | os.PathLike[str] | None = None,
+        approvals_state: str | os.PathLike[str] | None = None,
     ) -> None:
         first, last = int(claim[0]), int(claim[1])
         if first < 0 or first > last:
@@ -1499,6 +1650,10 @@ class AgentConnector:
         self.t3code_state = (
             Path(os.path.expanduser(os.fspath(t3code_state)))
             if t3code_state is not None else Path(os.devnull)
+        )
+        self.approvals_state = (
+            Path(os.path.expanduser(os.fspath(approvals_state)))
+            if approvals_state is not None else Path(os.devnull)
         )
         self.focus_cmd = focus_cmd
         self.poll_interval = poll_interval
@@ -1603,8 +1758,12 @@ class AgentConnector:
         agents += read_agents(self.desktop_state, source_default="desktop")
         agents += read_agents(self.t3code_state, source_default="t3code")
         agents = collapse_t3_shadows(agents)
+        agents = collapse_claude_desktop_shadows(agents)
         agents = decay_stale(agents, current)
         agents = drop_uninteresting(agents, current, self.max_age_hours)
+        agents = apply_discord_approvals(
+            agents, read_pending_approvals(self.approvals_state),
+        )
         agents = dedupe_labels(agents)
         for view in read_viewed(self.desktop_state):
             for agent in agents:
@@ -2062,6 +2221,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-state", default=DEFAULT_LOCAL_STATE)
     parser.add_argument("--desktop-state", default=DEFAULT_DESKTOP_STATE)
     parser.add_argument("--t3code-state", default=DEFAULT_T3CODE_STATE)
+    parser.add_argument("--approvals-state", default=DEFAULT_APPROVALS_STATE)
     parser.add_argument("--ack-state", default=DEFAULT_ACK_STATE)
     parser.add_argument("--focus-cmd", default=DEFAULT_FOCUS_CMD)
     parser.add_argument("--apps-config", default=DEFAULT_APPS_CONFIG)
@@ -2088,6 +2248,7 @@ def main(argv: list[str] | None = None) -> int:
         local_state=args.local_state,
         desktop_state=args.desktop_state,
         t3code_state=args.t3code_state,
+        approvals_state=args.approvals_state,
         ack_state=args.ack_state,
         focus_cmd=args.focus_cmd,
         poll_interval=args.poll_interval,

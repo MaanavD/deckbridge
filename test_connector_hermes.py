@@ -275,6 +275,53 @@ async def run() -> None:
                 and record["command"] == "echo hi"
                 and expired is None,
             )
+            emoji = hermes_discord_watcher.approval_from_message(
+                {
+                    "id": "303",
+                    "embeds": [{"title": "⚠️ Command Approval Required"}],
+                    "components": [{
+                        "components": [
+                            {"type": 2, "label": "Allow Once", "disabled": False},
+                        ],
+                    }],
+                },
+                channel_id="1549244444111405178",
+                guild_id="456",
+            )
+            needs_input = hermes_discord_watcher.approval_from_message(
+                {
+                    "id": "304",
+                    "embeds": [{"title": "❓ Hermes needs your input"}],
+                    "components": [{
+                        "components": [
+                            {"type": 2, "label": "1. Today", "disabled": False},
+                        ],
+                    }],
+                },
+                channel_id="1549244444111405178",
+                guild_id="456",
+            )
+            resolved = hermes_discord_watcher.approval_from_message(
+                {
+                    "id": "305",
+                    "embeds": [{"title": "⚠️ Command Approval Required"}],
+                    "components": [{
+                        "components": [
+                            {"type": 2, "label": "Allow Once", "disabled": True},
+                            {"type": 2, "label": "Deny", "disabled": True},
+                        ],
+                    }],
+                },
+                channel_id="1549244444111405178",
+                guild_id="456",
+            )
+            check(
+                "emoji Tirith titles with open buttons stay pending",
+                emoji is not None
+                and emoji["channel_id"] == "1549244444111405178"
+                and needs_input is not None
+                and resolved is None,
+            )
 
             # No guild id is configured on the target host.  A server-channel
             # approval must therefore resolve its guild via GET /channels once;
@@ -303,6 +350,74 @@ async def run() -> None:
                 and json.loads(resolved_path.read_text(encoding="utf-8"))[
                     "pending"
                 ][0]["guild_id"] == "resolved-guild",
+            )
+
+            thread_path = Path(tmp) / "thread_approvals.json"
+            def fetch_by_channel(_token, channel_id, **_kwargs):
+                if channel_id == "home-forum":
+                    return [{"id": "starter", "content": "gym tonight"}]
+                if channel_id == "1549244444111405178":
+                    return [{
+                        "id": "306",
+                        "embeds": [{"title": "⚠️ Command Approval Required"}],
+                        "components": [{
+                            "components": [
+                                {"type": 2, "label": "Allow Once", "disabled": False},
+                            ],
+                        }],
+                    }]
+                return []
+            hermes_discord_watcher.fetch_messages = fetch_by_channel
+            hermes_discord_watcher.fetch_channel_guild_id = (
+                lambda *_args, **_kwargs: "1507988913527062618"
+            )
+            try:
+                from_thread = hermes_discord_watcher.poll_once(
+                    "token", "home-forum", state_path=thread_path,
+                    guild_id="1507988913527062618",
+                    extra_channel_ids=["1549244444111405178"],
+                )
+            finally:
+                hermes_discord_watcher.fetch_messages = original_fetch_messages
+                hermes_discord_watcher.fetch_channel_guild_id = original_fetch_guild
+            check(
+                "watcher finds Tirith prompts inside agent threads",
+                len(from_thread) == 1
+                and from_thread[0]["channel_id"] == "1549244444111405178"
+                and from_thread[0]["url"].endswith(
+                    "/1507988913527062618/1549244444111405178/306"
+                ),
+            )
+
+            forum_path = Path(tmp) / "forum_approvals.json"
+            def fetch_forum(_token, channel_id, **_kwargs):
+                if channel_id == "home-forum":
+                    return [{"id": "1548965645373280297", "content": "set wake"}]
+                if channel_id == "1548965645373280297":
+                    return [{
+                        "id": "307",
+                        "embeds": [{"title": "⚠️ Command Approval Required"}],
+                        "components": [{
+                            "components": [
+                                {"type": 2, "label": "Deny", "disabled": False},
+                            ],
+                        }],
+                    }]
+                return []
+            hermes_discord_watcher.fetch_messages = fetch_forum
+            try:
+                from_forum = hermes_discord_watcher.poll_once(
+                    "token", "home-forum", state_path=forum_path,
+                    guild_id="1507988913527062618",
+                )
+            finally:
+                hermes_discord_watcher.fetch_messages = original_fetch_messages
+                hermes_discord_watcher.fetch_channel_guild_id = original_fetch_guild
+            check(
+                "watcher follows forum starter ids into their threads",
+                len(from_forum) == 1
+                and from_forum[0]["channel_id"] == "1548965645373280297"
+                and from_forum[0]["message_id"] == "307",
             )
 
             fake_log = FakeLog()

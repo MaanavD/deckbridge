@@ -935,6 +935,12 @@ check_sh 'a Claude conversation UUID becomes a claude:// deep link' \
    [ "$(deep_link_for_agent Claude 550e8400-e29b-41d4-a716-446655440000)" \
      = "claude://claude.ai/chat/550e8400-e29b-41d4-a716-446655440000" ]'
 
+check_sh 'a Claude chat scheduled task uses its recorded chat route' \
+  'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
+   URL=claude://claude.ai/scheduled-task/sf-flux-events-search;
+   [ "$(recorded_claude_url)" = "$URL" ];
+   ! deep_link_for_agent Claude sf-flux-events-search'
+
 check_sh 'a Claude Code desktop session becomes an exact local deep link' \
   'FOCUS_AGENT_LIB_ONLY=1 . "$SCRIPT";
    [ "$(deep_link_for_agent Claude local_550e8400-e29b-41d4-a716-446655440000)" \

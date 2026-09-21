@@ -231,6 +231,17 @@ def main() -> int:
               hermes_agents_probe.guild_id_from_discord_url(
                   "discord://-/channels/1507988913527062618/1")
               == "1507988913527062618")
+        check("discord:// and https Discord URLs name the same channel",
+              hermes_agents_probe.discord_route_ids(
+                  "discord://-/channels/1507988913527062618/1549244444111405178")
+              == hermes_agents_probe.discord_route_ids(
+                  "https://discord.com/channels/1507988913527062618/"
+                  "1549244444111405178/9"))
+        check("a Hammerspoon extension-load prefix still yields a jump URL",
+              hermes_agents_probe.discord_url_in_text(
+                  "-- Loading extension: axuielement\n"
+                  '{"url":"https://discord.com/channels/1/2"}')
+              == "https://discord.com/channels/1/2")
 
         # Regression: the two bugs that put dead agents on the board.
         check("a session with no activity timestamp is excluded",

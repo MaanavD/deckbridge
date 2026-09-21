@@ -877,6 +877,46 @@ def test_codex_permission_completion_clears_attention() -> None:
           state["agents"][0]["status"] == "working")
 
 
+def test_claude_shim_drops_cursor_shaped_payloads() -> None:
+    """Cursor invokes claude_shim with its own payload. That is not a session."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state = Path(tmp) / "state.json"
+        real = run(CLAUDE, state, {
+            "session_id": "claude-real", "cwd": "/work/proj",
+            "hook_event_name": "UserPromptSubmit",
+        })
+        check("a real Claude hook still records", real.returncode == 0
+              and agents(state)["cc-proj"]["cwd"] == "/work/proj",
+              real.stderr)
+        shadow = run(CLAUDE, state, {
+            "session_id": "4c3ce4c6-77d4-4c87-bdf1-f118d5a10848",
+            "conversation_id": "4c3ce4c6-77d4-4c87-bdf1-f118d5a10848",
+            "hook_event_name": "afterAgentThought",
+            "cursor_version": "3.18.9",
+            "workspace_roots": ["/tmp/cursor-workspace"],
+        })
+        found = read(state)["agents"]
+        check("a Cursor payload does not become a Claude key",
+              shadow.returncode == 0 and shadow.stdout == ""
+              and [a["session_id"] for a in found] == ["claude-real"],
+              str(found))
+        # A shadow left by an older shim is removed the next time Cursor fires.
+        state.write_text(json.dumps({"agents": found + [{
+            "name": "cc-cc0848", "status": "working", "cwd": "",
+            "source": "claude-code",
+            "session_id": "4c3ce4c6-77d4-4c87-bdf1-f118d5a10848",
+            "updated_at": time.time(),
+        }]}), encoding="utf-8")
+        run(CLAUDE, state, {
+            "session_id": "4c3ce4c6-77d4-4c87-bdf1-f118d5a10848",
+            "conversation_id": "4c3ce4c6-77d4-4c87-bdf1-f118d5a10848",
+            "hook_event_name": "afterAgentThought",
+            "workspace_roots": ["/tmp/cursor-workspace"],
+        })
+        check("an existing Cursor shadow is removed",
+              [a["session_id"] for a in read(state)["agents"]] == ["claude-real"])
+
+
 def test_claude_notifications_preserve_real_attention_state() -> None:
     common = {
         "name": "cc-Fix auth", "cwd": "/work/project", "ttl": 0,
@@ -934,6 +974,7 @@ def test_tty_ancestry_handles_processes_without_a_terminal() -> None:
 def main() -> int:
     test_event_mapping()
     test_codex_permission_completion_clears_attention()
+    test_claude_shim_drops_cursor_shaped_payloads()
     test_claude_notifications_preserve_real_attention_state()
     test_prompt_titles()
     test_prompt_title_survives_later_status_hooks()

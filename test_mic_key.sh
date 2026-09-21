@@ -635,6 +635,7 @@ check excludes "$out" 'gesture=hold'
 check contains "$(cat "$hs_open_log")" 'op=focus-text-entry'
 check contains "$(cat "$hs_open_log")" 'op=start-dictation'
 
+check grep -q 'function deckbridgeDiscordSnapshot()' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
 check grep -q 'hs.urlevent.bind("deckbridge-dictation"' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
 check grep -q 'Start Dictation' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"
 check grep -q 'runMicHelper' "$SCRIPT_DIR/hammerspoon_deckbridge.lua"

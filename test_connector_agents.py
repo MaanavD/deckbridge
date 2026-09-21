@@ -25,6 +25,7 @@ import connector_agents as connector_module  # noqa: E402
 
 from connector_agents import (  # noqa: E402
     AgentConnector, LocalLivenessProbe, SlotMap, agent_key, collapse_t3_shadows,
+    collapse_claude_desktop_shadows,
     dedupe_labels, decay_stale, drop_uninteresting, face_for,
     guild_id_from_discord_url, normalize_status,
     read_agents, read_launchers, read_shortcuts, launcher_face, workspace_identity,
@@ -483,6 +484,28 @@ def test_merges_native_desktop_surfaces() -> None:
               (Path(tmp) / "focus").read_text(encoding="utf-8").strip() == "Claude|chat-1")
 
 
+def test_claude_desktop_file_absorbs_the_matching_hook() -> None:
+    """One Code-tab conversation must not occupy both a hook key and a desktop key."""
+    desktop = {
+        "name": "Sf flux", "source": "claude-desktop", "status": "done",
+        "session_id": "local_a", "cli_session_id": "cli-1",
+    }
+    hook = {
+        "name": "cc-proj", "source": "claude-code", "status": "blocked",
+        "session_id": "cli-1",
+    }
+    other = {
+        "name": "cx-proj", "source": "codex-cli", "status": "working",
+        "session_id": "cli-1",
+    }
+    merged = collapse_claude_desktop_shadows([hook, desktop, other])
+    check("desktop Claude session replaces its CLI hook shadow",
+          [item["source"] for item in merged] == ["claude-desktop", "codex-cli"],
+          str(merged))
+    check("a blocked hook still marks the desktop session",
+          desktop["status"] == "blocked", str(desktop))
+
+
 def test_t3_managed_provider_children_follow_authoritative_thread_coverage() -> None:
     """Suppress a provider child only when T3 publishes its owning thread."""
     now = time.time()
@@ -803,15 +826,15 @@ def test_manual_surface_view_acknowledges_the_current_event() -> None:
         desktop = root / "desktop.json"
         write(hermes, [{
             "name": "review draft", "status": "done",
-            "source": "hermes-discord", "thread_id": "thread-7",
-            "url": "https://discord.com/channels/guild/thread-7",
+            "source": "hermes-discord", "thread_id": "1549244444111405178",
+            "url": "https://discord.com/channels/1507988913527062618/1549244444111405178",
             "updated_at": now,
         }])
         desktop.write_text(json.dumps({
             "agents": [],
             "viewed": [{
                 "source": "hermes-discord",
-                "url": "https://discord.com/channels/guild/thread-7/message-9",
+                "url": "https://discord.com/channels/1507988913527062618/1549244444111405178/message-9",
             }],
         }), encoding="utf-8")
         c = AgentConnector(
@@ -830,14 +853,68 @@ def test_manual_surface_view_acknowledges_the_current_event() -> None:
         desktop.write_text(json.dumps({"agents": [], "viewed": []}), encoding="utf-8")
         write(hermes, [{
             "name": "review draft", "status": "done",
-            "source": "hermes-discord", "thread_id": "thread-7",
-            "url": "https://discord.com/channels/guild/thread-7",
+            "source": "hermes-discord", "thread_id": "1549244444111405178",
+            "url": "https://discord.com/channels/1507988913527062618/1549244444111405178",
             "updated_at": now + 1,
         }])
         next_face = c.build_faces(c.collect(now + 1))[0]
         check("a later completion in that thread still needs attention",
               next_face["seen"] is False
               and next_face["sublabel"] == "NEEDS YOU", str(next_face))
+
+        desktop.write_text(json.dumps({
+            "agents": [],
+            "viewed": [{
+                "source": "hermes-discord",
+                "url": "discord://-/channels/1507988913527062618/1549244444111405178",
+            }],
+        }), encoding="utf-8")
+        scheme_face = c.build_faces(c.collect(now + 1))[0]
+        check("a discord:// selected channel acknowledges the https jump URL",
+              scheme_face.get("seen") is True
+              and scheme_face.get("sublabel") == "done", str(scheme_face))
+
+
+def test_discord_tirith_prompt_is_needs_you() -> None:
+    """A finished Hermes thread still waiting on Allow/Deny is unread work."""
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        hermes = root / "hermes.json"
+        approvals = root / "approvals.json"
+        write(hermes, [{
+            "name": "Schedule gy", "status": "done",
+            "source": "hermes-discord",
+            "thread_id": "1549244444111405178",
+            "url": "https://discord.com/channels/1507988913527062618/1549244444111405178",
+            "updated_at": now - 60,
+        }])
+        approvals.write_text(json.dumps({
+            "pending": [{
+                "message_id": "1549245093515497554",
+                "channel_id": "1549244444111405178",
+                "command": "gapi calendar delete",
+                "created_ts": now,
+                "url": (
+                    "https://discord.com/channels/1507988913527062618/"
+                    "1549244444111405178/1549245093515497554"
+                ),
+            }],
+        }), encoding="utf-8")
+        c = AgentConnector(
+            hermes_state=hermes, local_state=root / "none.json",
+            approvals_state=approvals,
+        )
+        agents = c.collect(now)
+        face = c.build_faces(agents)[0]
+        check("a Discord Tirith prompt turns the thread blocked",
+              bool(agents) and agents[0]["status"] == "blocked",
+              str(agents))
+        check("a Discord Tirith prompt shouts NEEDS YOU",
+              face.get("sublabel") == "NEEDS YOU"
+              and face.get("effect") == "breathe"
+              and face.get("seen") is False,
+              str(face))
 
 
 def test_seen_expires_when_the_agent_moves_on() -> None:
@@ -1505,27 +1582,30 @@ def test_fixed_bottom_row_shortcuts() -> None:
               sorted(faces) == list(range(14)))
         check("keys 10-13 are the requested permanent apps",
               [faces[i]["source"] for i in range(10, 14)]
-              == ["slack", "gmail", "discord", "notion-calendar"])
+              == ["slack", "command-board", "discord", "notion-calendar"])
         check("all four permanent apps are pressable",
               all(i in c._launcher_keys for i in range(10, 14)))
-        check("Gmail is pinned to the work Chrome profile",
-              c._launcher_keys[11].get("profile") == "Default")
+        check("the command board is pinned to the work Chrome profile",
+              c._launcher_keys[11].get("profile") == "Default"
+              and "notion.com" in c._launcher_keys[11].get("url", ""))
         check("Discord is available without private server configuration",
               c._launcher_keys[12].get("bundle") == "Discord"
               and not c._launcher_keys[12].get("url"))
 
         class Badges:
             def counts(self):
-                return {"slack": 2, "gmail": 7, "discord": 1}
+                return {"slack": 2, "discord": 1, "gmail": 7}
 
             def refresh(self):
                 return self.counts()
 
         c.badge_provider = Badges()
         faces = c.build_faces([])
+        # The board key counts nothing: a board has no unread. A count for a
+        # source no longer on the row must not leak onto its neighbour.
         check("utility launchers carry truthful unread counts",
               [faces[i].get("notification_count", 0) for i in range(10, 14)]
-              == [2, 7, 1, 0])
+              == [2, 0, 1, 0])
 
 
 def test_launcher_press_launches_the_app() -> None:
@@ -1554,8 +1634,8 @@ def test_launcher_press_launches_the_app() -> None:
         check("an invalid launch template does not raise", True)
 
 
-def test_gmail_reuses_the_work_profile_window() -> None:
-    """The Gmail key focuses an existing work Gmail tab, and only opens one if none exist."""
+def test_work_key_reuses_the_work_profile_window() -> None:
+    """The work key focuses an existing work tab, and only opens one if none exist."""
     check("Chrome titles with a parenthetical account still belong to that profile",
           connector_module.chrome_window_belongs_to_profile(
               "Inbox - Google Chrome - Maanav (blackforestlabs.ai)",
@@ -1583,14 +1663,29 @@ def test_gmail_reuses_the_work_profile_window() -> None:
           and "item i of windowNames" not in connector_module._CHROME_TAB_SCRIPT)
     check("an unmatched-profile Gmail tab is still reused instead of duplicated",
           "fallbackWinId" in connector_module._CHROME_TAB_SCRIPT)
+    board = connector_module.COMMAND_BOARD_URL
+    check("a Notion page is recognised however Notion rewrote the address",
+          connector_module.chrome_tab_matches_url(
+              "https://www.notion.so/bfl/Command-Board-8bf47822e6014b40a9e7a081e741f321",
+              board)
+          and connector_module.chrome_tab_matches_url(
+              "https://app.notion.com/p/8bf47822e6014b40a9e7a081e741f321?v=other",
+              board))
+    check("another Notion page is not mistaken for the board",
+          not connector_module.chrome_tab_matches_url(
+              "https://www.notion.so/bfl/Notes-11111111111111111111111111111111",
+              board))
+    check("the view id in the query is not used as the page identity",
+          connector_module.chrome_tab_match_token(board)
+          == "8bf47822e6014b40a9e7a081e741f321")
     check("the tab script only creates a tab after that search",
           connector_module._CHROME_TAB_SCRIPT.find("make new tab")
           > connector_module._CHROME_TAB_SCRIPT.find("focused-tab"))
 
     c = AgentConnector()
-    gmail = {
-        "label": "Gmail", "source": "gmail", "bundle": "Google Chrome",
-        "url": "https://mail.google.com/mail/u/0/",
+    work_key = {
+        "label": "Command Board", "source": "command-board",
+        "bundle": "Google Chrome", "url": board,
         "profile": "Default", "profile_name": "blackforestlabs.ai",
     }
     original_run = connector_module.subprocess.run
@@ -1604,16 +1699,17 @@ def test_gmail_reuses_the_work_profile_window() -> None:
     connector_module.subprocess.run = lambda argv, **kwargs: (
         focused_calls.append(list(argv)) or Result("focused-tab\n"))
     try:
-        c.launch(gmail)
+        c.launch(work_key)
     finally:
         connector_module.subprocess.run = original_run
-    check("existing Gmail is focused in one Chrome query",
+    check("an existing board tab is focused in one Chrome query",
           len(focused_calls) == 1
           and focused_calls[0][0] == "/usr/bin/osascript"
           and "blackforestlabs.ai" in focused_calls[0]
-          and "https://mail.google.com/mail/u/0/" in focused_calls[0],
+          and board in focused_calls[0]
+          and "8bf47822e6014b40a9e7a081e741f321" in focused_calls[0],
           repr(focused_calls))
-    check("an already-open Gmail never launches Chrome again",
+    check("an already-open board never launches Chrome again",
           all("Google Chrome" not in "".join(map(str, call))
               or call[0] == "/usr/bin/osascript"
               for call in focused_calls),
@@ -1629,15 +1725,15 @@ def test_gmail_reuses_the_work_profile_window() -> None:
 
     connector_module.subprocess.run = missing_then_launch
     try:
-        c.launch(gmail)
+        c.launch(work_key)
     finally:
         connector_module.subprocess.run = original_run
     fallback = missing_calls[-1] if missing_calls else []
     check("missing work window still targets Chrome's Default profile",
           "--profile-directory=Default" in fallback, repr(missing_calls))
-    check("missing work window opens Gmail without --new-window",
-          "https://mail.google.com/mail/u/0/" in fallback
-          and "--new-window" not in fallback, repr(missing_calls))
+    check("missing work window opens the board without --new-window",
+          board in fallback and "--new-window" not in fallback,
+          repr(missing_calls))
 
 
 def test_personal_chrome_focuses_or_creates_its_exact_profile() -> None:
@@ -1814,6 +1910,7 @@ def main() -> int:
     test_idle_and_old_are_dropped()
     test_merges_both_feeds()
     test_merges_native_desktop_surfaces()
+    test_claude_desktop_file_absorbs_the_matching_hook()
     test_t3_managed_provider_children_follow_authoritative_thread_coverage()
     test_workspace_identity_collapses_cursor_project_mirrors()
     test_t3_cursor_thread_absorbs_matching_hook_and_hermes_shadows()
@@ -1825,6 +1922,7 @@ def main() -> int:
     test_seen_marks_a_key_without_changing_its_status()
     test_done_needs_attention_until_viewed()
     test_manual_surface_view_acknowledges_the_current_event()
+    test_discord_tirith_prompt_is_needs_you()
     test_seen_expires_when_the_agent_moves_on()
     test_long_press_dismisses_and_short_press_focuses()
     test_long_press_reflows_survivors_before_launchers_return()
@@ -1847,7 +1945,7 @@ def main() -> int:
     test_launcher_config_is_editable_and_forgiving()
     test_fixed_bottom_row_shortcuts()
     test_launcher_press_launches_the_app()
-    test_gmail_reuses_the_work_profile_window()
+    test_work_key_reuses_the_work_profile_window()
     test_personal_chrome_focuses_or_creates_its_exact_profile()
     test_claim_validation()
     test_remote_feed_failure_is_visible_on_the_deck()
