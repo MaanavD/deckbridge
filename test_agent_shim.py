@@ -118,25 +118,22 @@ def test_short_label() -> None:
 
 
 def test_prompt_titles() -> None:
-    check("session naming request becomes a useful compact title",
+    check("praise is skipped for the real request",
           agent_shim.smart_title(
-              "And then can we do better with session title naming?"
-          ) == "Sess titles")
-    check("a broken voice report keeps both action and subject",
-          agent_shim.smart_title(
-              "None of the voice ones work at all - no idea how to fix that"
-          ) == "Fix voice")
-    check("test-suite request does not waste space on pleasantries",
-          agent_shim.smart_title(
-              "Please can you run the full test suite to make sure it works?"
-          ) == "Run tests")
-    check("long prompts never exceed the producer label budget",
-          len(agent_shim.smart_title("Investigate accessibility permissions"))
-          <= agent_shim.DEFAULT_LABEL_CHARS)
+              "awesome work! do we have some concatenation strategy for longer names?"
+          ) == "Do we have some concatenation strategy", )
+    check("a short request is kept whole",
+          agent_shim.smart_title("Fix Discord reconnects") == "Fix Discord reconnects")
+    check("code and links never reach the title",
+          agent_shim.smart_title("see https://x.com/a ```rm -rf /``` then run tests")
+          == "See then run tests")
+    check("long prompts are cut at a word and never exceed the budget",
+          len(agent_shim.smart_title("word " * 30)) <= agent_shim.TITLE_CHARS
+          and not agent_shim.smart_title("word " * 30).endswith(" "))
     check("Claude prompt payload is accepted only for prompt events",
           agent_shim.payload_title(
               {"prompt": "Fix Discord reconnects"}, "UserPromptSubmit"
-          ) == "Fix Discord")
+          ) == "Fix Discord reconnects")
     check("tool payload text cannot rename a session",
           agent_shim.payload_title(
               {"message": "Permission required"}, "PreToolUse"
@@ -157,6 +154,36 @@ def test_prompt_title_survives_later_status_hooks() -> None:
           later["name"] == "cx-Fix voice", str(later))
     check("only the compact title is retained, not its source prompt",
           later.get("display_title") == "Fix voice", str(later))
+
+
+def test_model_is_recorded_and_follows_switches() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        transcript = Path(tmp) / "t.jsonl"
+        transcript.write_text(
+            '{"message":{"model":"claude-sonnet-5"}}\n'
+            '{"message":{"model":"<synthetic>"}}\n'
+            '{"message":{"model":"claude-opus-5-5","content":"say \\"model\\":\\"x\\""}}\n'
+        )
+        check("hook payload model wins",
+              agent_shim.payload_model({"model": "gpt-6-sol",
+                                        "transcript_path": str(transcript)}) == "gpt-6-sol")
+        found = agent_shim.payload_model({"transcript_path": str(transcript)})
+        check("transcript tail names the newest real model",
+              found == "claude-opus-5-5", found)
+        check("no model and no transcript is empty",
+              agent_shim.payload_model({"transcript_path": str(Path(tmp) / "nope")}) == "")
+    first = agent_shim.upsert(
+        [], name="cc-x", status="working", cwd="/w", now=1.0,
+        source="claude-code", session_id="s", model="claude-sonnet-5",
+    )
+    kept = agent_shim.upsert(first, name="cc-x", status="done", cwd="/w",
+                             now=2.0, source="claude-code", session_id="s")[0]
+    check("a hook without a model keeps the known one",
+          kept.get("model") == "claude-sonnet-5", str(kept))
+    switched = agent_shim.upsert([kept], name="cc-x", status="working", cwd="/w",
+                                 now=3.0, source="claude-code", session_id="s",
+                                 model="claude-opus-5-5")[0]
+    check("a /model switch replaces it", switched.get("model") == "claude-opus-5-5")
 
 
 def test_agent_profiles() -> None:
@@ -209,7 +236,7 @@ def test_codex_wrapper() -> None:
             "hook_event_name": "UserPromptSubmit",
             "prompt": "None of the voice ones work at all",
         })
-        titled = agents(state).get("cx-Fix voice", {})
+        titled = agents(state).get("cx-None of the voice ones work at all", {})
         check("Codex prompt replaces the repo basename with a task title",
               bool(titled), str(agents(state)))
         run(CODEX, state, {
@@ -217,7 +244,7 @@ def test_codex_wrapper() -> None:
             "hook_event_name": "PreToolUse",
         })
         check("Codex tool hooks do not revert the task title",
-              bool(agents(state).get("cx-Fix voice")), str(agents(state)))
+              bool(agents(state).get("cx-None of the voice ones work at all")), str(agents(state)))
 
 
 def test_cursor_wrapper_uses_native_hook_fields() -> None:
@@ -978,6 +1005,7 @@ def main() -> int:
     test_claude_notifications_preserve_real_attention_state()
     test_prompt_titles()
     test_prompt_title_survives_later_status_hooks()
+    test_model_is_recorded_and_follows_switches()
     test_tty_is_recorded_and_sticky()
     test_surface_is_read_from_the_agent_environment()
     test_surface_is_recorded_and_sticky()

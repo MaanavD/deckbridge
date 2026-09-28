@@ -187,72 +187,35 @@ def short_label(cwd: str, session_id: str, agent: str = "generic",
     return base[:limit]
 
 
-_TITLE_STOPWORDS = {
-    "a", "about", "actually", "all", "also", "and", "at", "be", "better",
-    "btw", "can", "could", "do", "for", "full", "have", "how", "i", "idea",
-    "if", "in", "into", "is", "it", "just", "make", "much", "none", "of",
-    "on", "ones", "please", "really", "so", "some", "sure", "than", "that",
-    "the", "then", "this", "to", "up", "we", "with", "work", "working",
-    "worthwhile", "you",
-}
+#: Room for three short lines on a key; the renderer shrinks, then cuts.
+TITLE_CHARS = 40
+
+#: Openers that praise or acknowledge rather than ask for anything.
+_PLEASANTRY = re.compile(
+    r"^(?:awesome|amazing|great|nice|cool|sick|perfect|thanks?|thank you|ok(?:ay)?|"
+    r"love it|i like it|looks good|lgtm|yes|yep|sweet|good)\b[\w\s',]{0,24}$",
+    re.I,
+)
 
 
-def smart_title(text: str, limit: int = DEFAULT_LABEL_CHARS) -> str:
-    """Compress one user task into a useful tiny-key label.
+def smart_title(text: str, limit: int = TITLE_CHARS) -> str:
+    """The first real request in a prompt, cut at a word boundary.
 
-    This is intentionally deterministic and local: hooks must finish quickly,
-    and the full prompt must never be persisted merely to name a key.  Common
-    product phrases get human abbreviations; the generic path keeps the first
-    semantic words and fits them without cutting through a word when possible.
+    Hooks must finish quickly and must not persist the whole prompt, so this
+    keeps one sentence: praise like "awesome work!" is skipped.
     """
     clean = re.sub(r"```.*?```", " ", str(text or ""), flags=re.S)
     clean = re.sub(r"<[^>]+>|https?://\S+", " ", clean)
-    clean = re.sub(r"[^A-Za-z0-9+'-]+", " ", clean).strip()
-    if not clean or limit <= 0:
+    sentences = [" ".join(re.sub(r"[^A-Za-z0-9+'&/.,:-]+", " ", part).split())
+                 for part in re.split(r"[.!?\n]+(?:\s|$)", clean)]
+    sentences = [part.strip(" ,:-") for part in sentences if part.strip(" ,:-")]
+    if not sentences or limit <= 0:
         return ""
-    lower = clean.lower()
-
-    broken = bool(re.search(
-        r"\b(?:broken|fails?|failing|doesn'?t work|isn'?t working|not working)\b",
-        lower,
-    )) or bool(re.search(r"\bnone\b.*\bwork", lower))
-    action = ""
-    if broken or re.search(r"\bfix(?:e[ds])?\b", lower):
-        action = "Fix"
-    elif re.search(r"\b(?:run|test|verify|check)\b", lower):
-        action = "Run"
-    elif re.search(r"\b(?:add|create|install|build)\b", lower):
-        action = "Add"
-
-    # Phrases whose literal spelling wastes most of an 11-character key.
-    if "session" in lower and re.search(r"\b(?:title|titles|naming|name)\b", lower):
-        return "Sess titles"[:limit]
-    if re.search(r"\b(?:voice|microphone|mic)\b", lower):
-        topic = "voice"
-    elif "test suite" in lower or "tests" in lower:
-        topic = "tests"
-    elif "accessibility" in lower:
-        topic = "access"
-    elif re.search(r"\b(?:latency|performance|perf|slow)\b", lower):
-        topic = "speed"
-    else:
-        words = [w for w in re.findall(r"[A-Za-z0-9]+", clean)
-                 if w.lower() not in _TITLE_STOPWORDS
-                 and w.lower() not in {"fix", "run", "test", "verify", "check",
-                                       "add", "create", "install", "build",
-                                       "improve", "figure", "out"}]
-        if not words:
-            return clean[:limit].strip()
-        topic = words[0]
-        if len(words) > 1 and len(topic) + 1 + len(words[1]) <= limit:
-            topic = f"{topic} {words[1]}"
-
-    candidate = f"{action} {topic}".strip()
-    if len(candidate) <= limit:
-        return candidate
-    if len(topic) <= limit:
-        return topic
-    return topic[:limit].rstrip(" -_")
+    title = next((p for p in sentences if not _PLEASANTRY.match(p)), sentences[0])
+    if len(title) > limit:
+        cut = title[:limit + 1].rsplit(" ", 1)[0]
+        title = cut if len(cut) >= limit // 2 else title[:limit]
+    return title[:1].upper() + title[1:]
 
 
 def payload_title(payload: dict[str, Any], event: str) -> str:
@@ -685,6 +648,7 @@ def upsert(
     agent_pid: int | str | None = None,
     agent_started_at: str = "",
     display_title: str = "",
+    model: str = "",
 ) -> list[dict[str, Any]]:
     """Replace the same session, else append a distinct session record.
 
@@ -741,7 +705,8 @@ def upsert(
                          ("session_id", session_id), ("surface", surface),
                          ("herdr_pane", herdr_pane),
                          ("agent_pid", agent_pid),
-                         ("agent_started_at", agent_started_at)):
+                         ("agent_started_at", agent_started_at),
+                         ("model", model)):
         if value:
             record[field] = value
         elif (prior and prior.get(field)
@@ -814,6 +779,7 @@ def apply_event(
     agent_started_at: str = "",
     display_title: str = "",
     status_override: str | None = None,
+    model: str = "",
 ) -> dict[str, Any]:
     """Return the new state document for one hook event."""
     agents = prune(state.get("agents", []), now=now, ttl=ttl)
@@ -841,6 +807,7 @@ def apply_event(
             tty=tty, app=app, session_id=session_id, surface=surface,
             herdr_pane=herdr_pane, agent_pid=agent_pid,
             agent_started_at=agent_started_at, display_title=display_title,
+            model=model,
         )
     out = dict(state)
     out["agents"] = agents
@@ -880,6 +847,34 @@ def payload_cwd(payload: dict[str, Any], agent: str) -> str:
         return ""
     clean = [str(root).strip() for root in roots if str(root).strip()]
     return clean[0] if len(clean) == 1 else ""
+
+
+_TRANSCRIPT_MODEL = re.compile(r'"model"\s*:\s*"([^"]+)"')
+
+
+def payload_model(payload: dict[str, Any], tail_bytes: int = 65536) -> str:
+    """Model named by the hook, else the newest one in the transcript tail.
+
+    Only some events carry ``model``; every Claude and Codex event carries
+    ``transcript_path``, whose assistant entries record the model that answered.
+    """
+    model = payload.get("model")
+    if isinstance(model, dict):
+        model = model.get("id") or model.get("name")
+    if isinstance(model, str) and model.strip():
+        return model.strip()
+    path = str(payload.get("transcript_path") or "").strip()
+    if not path:
+        return ""
+    try:
+        with open(os.path.expanduser(path), "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - tail_bytes))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    found = [m for m in _TRANSCRIPT_MODEL.findall(tail) if not m.startswith("<")]
+    return found[-1] if found else ""
 
 
 def payload_session_id(payload: dict[str, Any], agent: str) -> str:
@@ -1050,6 +1045,7 @@ def main(argv: list[str] | None = None) -> int:
                 agent_pid=owner_pid,
                 agent_started_at=owner_started_at,
                 display_title=display_title,
+                model=payload_model(payload),
             )
             write_atomic(state_path, updated)
     except Exception as exc:  # never break the user's agent session

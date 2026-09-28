@@ -20,6 +20,11 @@ tested without Stream Deck hardware.
   viewed completions settle into the quiet done state.
 - Reads T3 Code's authenticated local API for exact thread titles, lifecycle,
   approvals, and pending user input. T3 threads use their native provider logo.
+- Each session key shows the task name on two lines, the lab's mark inline
+  with a short model name (`OPUS 5.5`, `GPT-6 ASTRA`) on the bottom line, and
+  the mark of where a tap takes you (T3, Discord, a terminal agent) in the
+  corner. Colour and motion carry status; only a key that needs you shows an
+  alert icon.
 - Focuses the exact application tab or terminal pane instead of merely raising
   an app.
 - Reflows keys after sessions end or are dismissed.
@@ -89,6 +94,7 @@ after installing its global hooks.
 Useful lifecycle commands:
 
 ```bash
+./deckbridge.sh sessions   # each key's model and how long it stays
 ./deckbridge.sh doctor
 ./deckbridge.sh start --hw
 ./deckbridge.sh status
@@ -149,6 +155,19 @@ Any launcher or shortcut can be replaced without changing the source. A Chrome
 shortcut targets one profile: it focuses that profile's existing tab for the
 URL, and only opens a new tab in that profile's window when none is open.
 
+## How long keys stay
+
+| Key state | Leaves the board |
+|---|---|
+| Working or blocked | Never while alive. A hook feed silent for 5 minutes is shown as done. |
+| Done, not yet opened | 24 hours after the result (`MAX_AGE_HOURS`) |
+| Done and opened, or idle | 2 hours after you last looked (`REST_HOURS`) |
+| Long-pressed | Immediately, until the session does something new |
+
+T3 threads also leave when archived or settled in T3. Set `MAX_AGE_HOURS` and
+`REST_HOURS` in `deckbridge.conf`; `./deckbridge.sh sessions` prints the time
+left on every key.
+
 ## Hold-to-talk dictation
 
 Key 14 sends the appropriate native shortcut to whichever supported app is
@@ -183,11 +202,15 @@ agent and app connectors ──► deckd.py WebSocket hub ──► Stream Deck 
 ```
 
 `deckd.py` owns the surface and routes presses to the connector that painted a
-key. `connector_agents.py` merges agent feeds, assigns stable slots, and handles
-focus/launch actions. `t3code_watcher.py` consumes T3's loopback API and rereads
+key. `connector_agents.py` assigns stable slots, builds key faces, and handles
+focus/launch actions; `agent_feeds.py` reads and merges the agent feeds,
+`local_liveness.py` proves local processes are alive, and `models.py` turns a
+model id into a lab mark and short name. `t3code_watcher.py` consumes T3's loopback API and rereads
 its runtime descriptor after every app restart. `connector_mic.py` owns hold-to-talk. External feeds use
 bounded retries and atomic last-good state so a temporary outage does not erase
-known sessions. See [PROTOCOL.md](PROTOCOL.md) for the wire protocol.
+known sessions. The Hermes watcher streams `hermes_agents_probe.py` over SSH
+on every poll, so the remote host never runs a stale copy. See
+[PROTOCOL.md](PROTOCOL.md) for the wire protocol.
 
 ## Development and tests
 
@@ -210,7 +233,7 @@ contain placeholders only. Before sharing diagnostics, inspect local logs under
 `~/Library/Logs/Deckbridge`; application titles and agent task names may appear
 there.
 
-Product names and logos are trademarks of their respective owners. Their use
+Provider marks come from Lobe Icons (MIT) and Simple Icons (CC0). Product names and logos are trademarks of their respective owners. Their use
 identifies compatible integrations and does not imply endorsement.
 
 ## License

@@ -26,7 +26,7 @@ import connector_agents as connector_module  # noqa: E402
 from connector_agents import (  # noqa: E402
     AgentConnector, LocalLivenessProbe, SlotMap, agent_key, collapse_t3_shadows,
     collapse_claude_desktop_shadows,
-    dedupe_labels, decay_stale, drop_uninteresting, face_for,
+    dedupe_labels, decay_stale, drop_unverified_idle, expires_at, face_for,
     guild_id_from_discord_url, normalize_status,
     read_agents, read_launchers, read_shortcuts, launcher_face, workspace_identity,
     DEFAULT_LAUNCHERS, DEFAULT_SHORTCUTS, LAUNCHER_COLOR,
@@ -149,8 +149,8 @@ def test_ssh_hosted_hermes_agents() -> None:
         agent_faces = {i: faces[i] for i in c._agent_keys}
         check("all three get their own key", len(agent_faces) == 3)
         badges = sorted(f["badge"] for f in agent_faces.values())
-        check("ssh agents show the S badge next to the H thread",
-              badges == ["H", "S", "S"], str(badges))
+        check("ssh agents show the S badge next to the Discord thread",
+              badges == ["D", "S", "S"], str(badges))
 
         # A press on an ssh agent must pass the session id, since there is no
         # URL to open and its cwd is a path on the remote host.
@@ -337,8 +337,8 @@ def test_exact_liveness_drops_dead_and_preserves_live_sessions() -> None:
               "unknown" in found, str(found))
         check("a verified-live idle session remains visible",
               "idle" in found, str(found))
-        check("a verified-live session outranks the wall-clock age cutoff",
-              "ancient" in found, str(found))
+        check("a finished result leaves at the age cutoff even while its process lives",
+              "ancient" not in found, str(found))
 
 
 def test_pid_liveness_checks_birth_marker_and_is_cached() -> None:
@@ -417,14 +417,60 @@ def test_idle_and_old_are_dropped() -> None:
     agents = [
         {"name": "busy", "status": "working", "updated_at": now, "source": "cmux"},
         {"name": "sleepy", "status": "idle", "updated_at": now, "source": "cmux"},
-        {"name": "ancient", "status": "done", "updated_at": now - 48 * 3600, "source": "cmux"},
-        {"name": "recent", "status": "done", "updated_at": now - 60, "source": "cmux"},
+        {"name": "open", "status": "idle", "updated_at": now, "source": "cmux",
+         "_verified_live": True},
     ]
-    kept = {a["name"] for a in drop_uninteresting(agents, now, 24.0)}
-    check("idle agents are dropped", "sleepy" not in kept)
-    check("agents past the age cutoff are dropped", "ancient" not in kept)
-    check("live agents are kept", "busy" in kept)
-    check("recently finished agents are kept", "recent" in kept)
+    kept = {a["name"] for a in drop_unverified_idle(agents)}
+    check("unverified idle agents are dropped", kept == {"busy", "open"}, str(kept))
+
+
+def test_retention_bounds() -> None:
+    day, rest = 24 * 3600.0, 2 * 3600.0
+    t = 1_000_000.0
+    check("working never expires",
+          expires_at({"status": "working", "updated_at": t}, None, day, rest) is None)
+    check("blocked never expires",
+          expires_at({"status": "blocked", "updated_at": t}, t, day, rest) is None)
+    check("an unseen result stays the full age",
+          expires_at({"status": "done", "updated_at": t}, None, day, rest) == t + day)
+    check("a seen result rests from when it was seen",
+          expires_at({"status": "done", "updated_at": t}, t + 600, day, rest)
+          == t + 600 + rest)
+    check("idle rests from its last activity",
+          expires_at({"status": "idle", "updated_at": t}, None, day, rest) == t + rest)
+
+
+def test_seen_results_leave_after_the_rest_window() -> None:
+    now = time.time()
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "local.json"
+        write(local, [{"name": "api", "status": "done", "cwd": "/w",
+                       "source": "codex-cli", "updated_at": now - 3 * 3600}])
+        c = AgentConnector(claim=(0, 9), hermes_state=Path(tmp) / "none.json",
+                           local_state=local, rest_hours=1.0)
+        c.liveness_probe = lambda agent: True
+        c.build_faces(c.collect(now))
+        check("an unseen three-hour-old result is still shown",
+              0 in c._agent_keys, str(c._agent_keys))
+        c.mark_seen(c._agent_keys[0], at=now)
+        check("it stays right after being seen", len(c.collect(now + 1800)) == 1)
+        check("it leaves after the rest window, even while the process lives",
+              c.collect(now + 3601) == [])
+
+
+def test_faces_show_the_model_and_its_lab() -> None:
+    face = face_for({"name": "x", "status": "done", "source": "t3code-claude",
+                     "model": "claude-opus-5-5"}, seen=True)
+    check("model replaces the status text",
+          face["sublabel"] == "Opus 5.5", str(face))
+    check("the lab mark travels with the face",
+          face["provider"] == "anthropic", str(face))
+    blocked = face_for({"name": "x", "status": "blocked", "source": "codex-cli",
+                        "model": "gpt-6-sol"})
+    check("an approval still says NEEDS YOU", blocked["sublabel"] == "NEEDS YOU")
+    bare = face_for({"name": "x", "status": "done", "source": "cmux"}, seen=True)
+    check("no model falls back to the status", bare["sublabel"] == "done"
+          and bare["provider"] == "", str(bare))
 
 
 def test_merges_both_feeds() -> None:
@@ -456,7 +502,7 @@ def test_merges_both_feeds() -> None:
               str(sorted(agent_faces)))
         badges = {f["badge"] for f in agent_faces.values()}
         check("a Hermes and both local tools are distinguishable by badge",
-              badges == {"H", "C", "X"}, str(badges))
+              badges == {"D", "C", "X"}, str(badges))
         check("presses are mapped for every lit key",
               set(c._agent_keys) == set(agent_faces))
 
@@ -587,7 +633,7 @@ def test_t3_cursor_thread_absorbs_matching_hook_and_hermes_shadows() -> None:
         found = [(a["source"], a["name"]) for a in connector.collect(now)]
         check("the T3 Cursor thread is the only deckbridge Cursor key",
               found == [("cursor-agent", "other repo"),
-                        ("t3code-cursor", "Fix Stream Deck Auto Start")],
+                        ("t3code-cursor", "Fix Stream Deck Auto-Start")],
               str(found))
         names = [a["name"] for a in collapse_t3_shadows([
             {"source": "t3code-claude", "cwd": "/repo", "session_id": "t1", "name": "claude"},
@@ -812,7 +858,7 @@ def test_done_needs_attention_until_viewed() -> None:
     viewed = face_for(agent, seen=True)
     check("viewing reveals the quiet done state",
           viewed["sublabel"] == "done" and viewed["effect"] == "solid"
-          and viewed["icon"] == "check-outline", str(viewed))
+          and viewed["icon"] is None, str(viewed))
     check("a viewed completion returns to done priority",
           slot_priority(agent, seen=True) == STATUS_ORDER["done"])
 
@@ -1065,10 +1111,15 @@ def test_faces_carry_the_logo_filename() -> None:
     letter in its place. The filename now travels with the face so the two
     renderers cannot disagree.
     """
-    face = face_for({"name": "chan", "status": "done", "source": "hermes-discord"})
-    check("the Hermes face names the configured Hermes mark",
+    face = face_for({"name": "chan", "status": "done", "source": "hermes-ssh"})
+    check("a terminal Hermes face names the configured Hermes mark",
           face["logo"] == connector_module.logos.HERMES_LOGO,
           str(face.get("logo")))
+    thread = face_for({"name": "chan", "status": "done", "source": "hermes-discord"})
+    check("a Discord Hermes thread wears the Discord mark, where a tap goes",
+          thread["logo"] == "discord.svg", str(thread.get("logo")))
+    t3 = face_for({"name": "t", "status": "done", "source": "t3code-claude"})
+    check("a T3 thread wears the T3 mark", t3["logo"] == "t3code.svg", str(t3))
     svg = face_for({"name": "x", "status": "done", "source": "claude-code"})
     check("an SVG source names its SVG",
           svg["logo"] == "claude-code.svg", str(svg.get("logo")))
@@ -1908,6 +1959,9 @@ def main() -> int:
     test_legacy_liveness_uses_all_available_exact_handles()
     test_remote_hermes_never_depends_on_local_liveness()
     test_idle_and_old_are_dropped()
+    test_retention_bounds()
+    test_seen_results_leave_after_the_rest_window()
+    test_faces_show_the_model_and_its_lab()
     test_merges_both_feeds()
     test_merges_native_desktop_surfaces()
     test_claude_desktop_file_absorbs_the_matching_hook()

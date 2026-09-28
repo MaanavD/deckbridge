@@ -415,6 +415,82 @@ def main() -> int:
     )
     check("missing DB is graceful", json.loads(failed.stdout) == {"agents": []})
 
+    with tempfile.TemporaryDirectory(prefix="deckbridge-probe-model-") as tmp:
+        db = Path(tmp) / "fixture.sqlite"
+        make_db(db)
+        con = sqlite3.connect(db)
+        con.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
+        con.commit()
+        con.close()
+        insert(db, id="m1", source="discord", archived=0, thread_id="3333",
+               title="With model", last_activity_at=now, cwd="",
+               last_activity_description="thinking", model="deepseek-v4.1-flash")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, tool_calls TEXT)")
+        con.execute("INSERT INTO messages (session_id, role, tool_calls) VALUES ('m1', 'user', NULL)")
+        con.commit()
+        con.close()
+        agents = run_probe(db)["agents"]
+        check("a turn with no reply yet is working",
+              agents and agents[0]["status"] == "working", str(agents))
+        con = sqlite3.connect(db)
+        con.execute("INSERT INTO messages (session_id, role, tool_calls) VALUES ('m1', 'assistant', NULL)")
+        con.commit()
+        con.close()
+        agents = run_probe(db)["agents"]
+        check("a final reply is done even if the description lingers",
+              agents and agents[0]["status"] == "done", str(agents))
+        check("the session model reaches the deck record",
+              agents and agents[0].get("model") == "deepseek-v4.1-flash", str(agents))
+
+    # Hermes multiplexes profiles: the default profile keeps ``state.db`` at the
+    # Hermes home, every extra profile keeps its own under ``profiles/<name>/``.
+    # Reading only the default DB hid every work-profile thread from the deck.
+    with tempfile.TemporaryDirectory(prefix="deckbridge-probe-profiles-") as tmp:
+        home = Path(tmp)
+        main_db = home / "state.db"
+        make_db(main_db)
+        insert(
+            main_db,
+            id="p_personal", source="discord", archived=0,
+            thread_id="1111111111111111111", title="Personal planning",
+            last_activity_at=now - 30, last_activity_description="thinking",
+            cwd="/home/maanav",
+        )
+        work_dir = home / "profiles" / "work"
+        work_dir.mkdir(parents=True)
+        work_db = work_dir / "state.db"
+        make_db(work_db)
+        insert(
+            work_db,
+            id="p_work", source="discord", archived=0,
+            thread_id="2222222222222222222", title="Work command board",
+            last_activity_at=now - 30, last_activity_description="thinking",
+            cwd="/home/maanav/work",
+        )
+        merged = {
+            a["thread_id"]: a
+            for a in run_probe(main_db, "--limit", "50")["agents"]
+        }
+        check("the default profile still reaches the deck",
+              "1111111111111111111" in merged, str(sorted(merged)))
+        check("a sibling profile's sessions also reach the deck",
+              "2222222222222222222" in merged, str(sorted(merged)))
+        check("each agent carries the profile it came from",
+              merged.get("2222222222222222222", {}).get("profile") == "work"
+              and merged.get("1111111111111111111", {}).get("profile") == "default",
+              str({k: v.get("profile") for k, v in merged.items()}))
+        solo = {
+            a["thread_id"]
+            for a in run_probe(main_db, "--no-profiles", "--limit", "50")["agents"]
+        }
+        check("--no-profiles reads only the default database",
+              solo == {"1111111111111111111"}, str(sorted(solo)))
+        check("profile discovery ignores a directory with no state database",
+              hermes_agents_probe.profile_db_paths(main_db) == [
+                  (main_db, "default"), (work_db, "work")],
+              str(hermes_agents_probe.profile_db_paths(main_db)))
+
     passed = sum(ok for _, ok in RESULTS)
     print(f"\n{passed}/{len(RESULTS)} passed")
     return 0 if passed == len(RESULTS) else 1

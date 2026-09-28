@@ -106,6 +106,33 @@ def main() -> int:
         check("a missing agent feed yields no thread ids",
               watcher.thread_ids_from_agents(Path(tmp) / "missing.json") == [])
 
+    def card(disabled: bool, footer: str = "") -> dict:
+        embed = {"type": "rich",
+                 "title": "\u26a0\ufe0f Hermes wants to run a command that needs your OK"}
+        if footer:
+            embed["footer"] = {"text": footer}
+        return {
+            "id": "1553000000000000001", "timestamp": "2026-09-24T23:19:10+00:00",
+            "content": ("\u26a0\ufe0f **Hermes wants to run a command that needs your OK**\n\n"
+                        "**Requested command:**\n```bash\ncurl -s x | python3\n```\n"
+                        "**Why it was flagged:** Pipe to interpreter\n"),
+            "embeds": [embed],
+            "components": [{"type": 1, "components": [
+                {"type": 2, "style": 3, "label": "Allow Once", "disabled": disabled},
+                {"type": 2, "style": 4, "label": "Deny", "disabled": disabled},
+            ]}],
+        }
+    record = watcher.approval_from_message(card(False), channel_id="42", guild_id="1")
+    check("the renamed 'needs your OK' card is a pending approval",
+          record is not None and record["command"] == "curl -s x | python3"
+          and record["reason"] == "Pipe to interpreter", str(record))
+    check("an answered card is not pending",
+          watcher.approval_from_message(card(True), channel_id="42") is None)
+    check("an expired card is not pending",
+          watcher.approval_from_message(
+              card(False, "\u23f1 Prompt expired \u2014 no action taken"),
+              channel_id="42") is None)
+
     passed = sum(ok for _, ok in RESULTS)
     print(f"\n{passed}/{len(RESULTS)} passed")
     return 0 if RESULTS and passed == len(RESULTS) else 1

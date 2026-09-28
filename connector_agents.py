@@ -1,34 +1,16 @@
 #!/usr/bin/env python3
 """Unified agent connector: sessions on 0-9, fixed shortcuts on 10-13.
 
-This replaces the split "Hermes owns 0-4, local agents own 5-9" layout.  Both
-feeds are merged into a single pool of up to ten slots, so a mix of Hermes
-Discord threads, Claude Code sessions, and Codex CLI sessions can fill the
-board in whatever proportion actually exists right now.
-
-Two input files, both polled, neither required:
-
-* ``~/.deckbridge/hermes_agents.json``  written by ``hermes_agents_watcher.py``
-* ``~/.deckbridge/cmux_state.json``     written by the agent hook shims and
-  ``cmux_shim.sh``
-
-Design decisions that matter, and why:
+Every agent feed (hooks, T3 Code, Claude Desktop, Hermes) is merged by
+``agent_feeds`` into one pool of up to ten slots.
 
 **Slots are pinned, not sorted.**  The first time an agent is seen it claims
 the lowest free slot and keeps it until it disappears.  Sorting the board by
-status every poll looks tidier but makes the deck unusable: a key can change
-meaning between deciding to press it and pressing it.  Priority order only
-decides *who gets a slot* when more agents exist than slots, never where a
-slot-holder sits.
+status every poll makes a key change meaning between deciding to press it and
+pressing it.  Priority only decides *who gets a slot* when the board is full.
 
-**No tool prefix in the label.**  The label is the project or thread name; the
-tool identity is a corner badge glyph instead.  Two agents in the same
-directory are disambiguated with a numeric suffix rather than a ``cc-``/``cx-``
-prefix eating the tiny label.
-
-**Idle agents are dropped.**  Only agents that need attention or are alive stay
-on the board; anything untouched past the cutoff ages out.  A board full of
-finished work hides the one thing that is blocked.
+**Every key has a lifetime.**  See ``RETENTION`` below; ``--once`` prints how
+long each visible key has left.
 
 Pressing a key runs the focus command with the agent's fields substituted,
 which is how a Hermes key opens its Discord thread and a local key raises its
@@ -47,7 +29,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, NamedTuple
 
 import websockets
 
@@ -59,16 +41,30 @@ from connection_runtime import (
     reconnect_forever,
 )
 
-# The logo/icon filename mapping lives in one module so the hardware renderer
-# and the browser emulator cannot disagree about what a key looks like.  The
-# emulator used to build `logos/<source>.svg` itself, which silently broke the
-# moment a source's mark became a PNG.
 import logos
-from hermes_agents_probe import (
-    discord_jump_url, discord_route_ids, guild_id_from_discord_url,
-    short_label,
+import models
+from agent_feeds import (  # noqa: F401  (re-exported for tests and tools)
+    STALE_WORKING_S, STATUS_ORDER, T3_SHADOW_SOURCES, VALID_STATUSES,
+    agent_key, apply_discord_approvals, collapse_claude_desktop_shadows,
+    collapse_t3_shadows, decay_stale, dedupe_labels, drop_unverified_idle,
+    expires_at,
+    ensure_hermes_discord_url, manual_view_matches, normalize_status,
+    read_agents, read_pending_approvals, read_viewed,
+    reconcile_local_liveness, workspace_identity,
 )
 from app_badges import AppBadgeProvider
+from chrome_focus import (  # noqa: F401
+    CHROME_BIN, _CHROME_RAISE_SCRIPT, _CHROME_TAB_SCRIPT,
+    chrome_tab_match_token, chrome_tab_matches_url,
+    chrome_titles_refer_to_same_window, chrome_window_belongs_to_profile,
+    lookup_chrome_profile_name, open_or_focus_chrome_tab,
+    raise_chrome_profile_window,
+)
+from hermes_agents_probe import guild_id_from_discord_url
+from local_liveness import (  # noqa: F401
+    LIVENESS_CACHE_S, LOCAL_SESSION_SOURCES, HerdrSshPaneResolver,
+    LocalLivenessProbe,
+)
 
 log = logging.getLogger("connector_agents")
 
@@ -93,23 +89,16 @@ DEFAULT_FOCUS_CMD = (
     "--environment-label {environment_label}"
 )
 
-#: Agents untouched for longer than this drop off the board entirely.
+#: RETENTION.  How long a key stays on the board without new activity:
+#:
+#: * working / blocked   while the session is alive.  A hook feed that goes
+#:   silent for ``STALE_WORKING_S`` is shown as done instead.
+#: * done, not yet seen  ``DEFAULT_MAX_AGE_HOURS`` after the result arrived.
+#: * done and seen, or idle  ``DEFAULT_REST_HOURS`` after you last looked
+#:   (or after the last activity, if later).
+#: * long-pressed        gone until the session does something new.
 DEFAULT_MAX_AGE_HOURS = 24.0
-
-#: An agent left in a live status with no update for this long is stale: the
-#: process died without a closing event.  Shown as done rather than working.
-STALE_WORKING_S = 300.0
-LIVENESS_CACHE_S = 5.0
-LOCAL_SESSION_SOURCES = frozenset({"claude-code", "codex-cli", "cursor-agent"})
-#: Hook/desktop/Hermes-CLI records that are the same work as a T3 thread.
-T3_SHADOW_SOURCES = {
-    "t3code-cursor": frozenset({"cursor-agent", "cursor-desktop"}),
-    "t3code-claude": frozenset({"claude-code", "claude-desktop"}),
-    "t3code-codex": frozenset({"codex-cli", "codex-desktop"}),
-}
-
-VALID_STATUSES = ("blocked", "working", "done", "idle")
-STATUS_ORDER = {"idle": 0, "done": 1, "working": 2, "blocked": 3}
+DEFAULT_REST_HOURS = 2.0
 
 STATUS_FACE = {
     "blocked": {"color": "#c0392b", "effect": "breathe", "icon": "alert"},
@@ -135,10 +124,6 @@ def slot_priority(agent: dict[str, Any], seen: bool = False) -> int:
 #: glance, not so far that it looks disabled or off.
 SEEN_DIM = 0.45
 
-#: The seen counterpart of each status icon.  A filled check becomes a hollow
-#: one: the same silhouette, so it is obviously the same thing, but visibly
-#: acknowledged.  Icons with no distinct seen form keep their own.
-SEEN_ICON = {"check": "check-outline"}
 
 #: Hold this long to dismiss a key instead of following it.  Long enough that a
 #: firm tap cannot trigger it by accident, short enough not to feel like a
@@ -271,6 +256,15 @@ SOURCE_BADGE = {
     "command-board": "B",
 }
 
+#: The corner mark shows where a tap takes you. T3 threads open in T3 and
+#: Hermes threads in Discord; the lab mark beside the model already says
+#: whose model is answering.
+HOME_SOURCE = {
+    "t3code-claude": "t3code", "t3code-codex": "t3code",
+    "t3code-cursor": "t3code", "t3code-grok": "t3code",
+    "t3code-opencode": "t3code", "hermes-discord": "discord",
+}
+
 #: Human-readable status text for the key's second line.
 STATUS_TEXT = {
     "blocked": "NEEDS YOU",
@@ -278,40 +272,6 @@ STATUS_TEXT = {
     "done": "done",
     "idle": "idle",
 }
-
-
-def normalize_status(status: object) -> str:
-    """Coerce any producer's status string into one of the four deck statuses."""
-    value = str(status).strip().lower().replace("-", " ").replace("_", " ")
-    if value in {"blocked", "waiting", "needs input", "needs you", "error", "approval"}:
-        return "blocked"
-    if value in {"working", "running", "busy"}:
-        return "working"
-    if value in {"done", "complete", "completed", "finished"}:
-        return "done"
-    return "idle"
-
-
-def agent_key(agent: dict[str, Any]) -> str:
-    """Return a stable identity for slot pinning.
-
-    Identity must survive status changes, so it is built from the fields that
-    do not change over a session's life.  A Hermes thread is identified by its
-    thread id, an ssh-hosted Hermes agent by its session id, and a local agent
-    by its source and name.  Falling back to the name for a session that has a
-    real id would merge every untitled agent into one key.
-    """
-    thread = str(agent.get("thread_id") or "").strip()
-    if thread:
-        return f"hermes:{thread}"
-    session = str(agent.get("session_id") or "").strip()
-    source = str(agent.get("source") or "local").strip()
-    if session:
-        # Session ids are only scoped by their producer. Test fixtures often
-        # use small ids like "s1", and two real tools are not required to
-        # coordinate UUID namespaces, so source is part of identity too.
-        return f"{source}:session:{session}"
-    return f"{source}:{agent.get('name') or agent.get('cwd') or '?'}"
 
 
 def _ack_stamp(value: Any) -> float:
@@ -322,21 +282,28 @@ def _ack_stamp(value: Any) -> float:
         return 0.0
 
 
-def _parse_ack_map(raw: Any) -> dict[str, tuple[str, float]]:
+class Ack(NamedTuple):
+    """An acknowledged event: the status and heartbeat it covered, and when."""
+    status: str
+    stamp: float
+    at: float
+
+
+def _parse_ack_map(raw: Any) -> dict[str, Ack]:
     if not isinstance(raw, dict):
         return {}
-    out: dict[str, tuple[str, float]] = {}
+    out: dict[str, Ack] = {}
     for key, token in raw.items():
         if not isinstance(key, str) or not key:
             continue
-        if isinstance(token, (list, tuple)) and len(token) == 2:
-            out[key] = (str(token[0]), _ack_stamp(token[1]))
+        if isinstance(token, (list, tuple)) and len(token) in (2, 3):
+            stamp = _ack_stamp(token[1])
+            at = _ack_stamp(token[2]) if len(token) == 3 else stamp
+            out[key] = Ack(str(token[0]), stamp, at)
     return out
 
 
-def load_acks(
-    path: Path,
-) -> tuple[dict[str, tuple[str, float]], dict[str, tuple[str, float]]]:
+def load_acks(path: Path) -> tuple[dict[str, Ack], dict[str, Ack]]:
     """Read persisted seen/dismissed tokens, or empty maps on any failure."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -348,16 +315,12 @@ def load_acks(
 
 
 def write_acks(
-    path: Path,
-    seen: dict[str, tuple[str, float]],
-    dismissed: dict[str, tuple[str, float]],
+    path: Path, seen: dict[str, Ack], dismissed: dict[str, Ack],
 ) -> None:
     """Atomically persist acknowledgements so a restart cannot resurrect keys."""
     payload = {
-        "seen": {key: [status, stamp] for key, (status, stamp) in seen.items()},
-        "dismissed": {
-            key: [status, stamp] for key, (status, stamp) in dismissed.items()
-        },
+        "seen": {key: list(ack) for key, ack in seen.items()},
+        "dismissed": {key: list(ack) for key, ack in dismissed.items()},
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(
@@ -378,16 +341,6 @@ def write_acks(
         raise
 
 
-def _clean_label(text: str) -> str:
-    """Strip the tool prefixes and separators that make a tiny label unreadable."""
-    label = str(text or "").strip()
-    for prefix in ("cc-", "cx-", "cu-", "cm-"):
-        if label.lower().startswith(prefix):
-            label = label[len(prefix):]
-            break
-    return label.replace("_", " ").replace("-", " ").strip()
-
-
 def configured_discord_guild_id(apps_config: Path | None = None) -> str:
     """Guild used to rebuild a Hermes jump URL when the probe omitted it."""
     env = str(os.environ.get("DISCORD_GUILD_ID") or "").strip()
@@ -401,748 +354,6 @@ def configured_discord_guild_id(apps_config: Path | None = None) -> str:
             if guild:
                 return guild
     return ""
-
-
-def ensure_hermes_discord_url(
-    agent: dict[str, Any], guild_id: str
-) -> dict[str, Any]:
-    """Fill a missing Discord jump URL from thread/channel id plus guild."""
-    if str(agent.get("source") or "") != "hermes-discord":
-        return agent
-    if str(agent.get("url") or "").strip():
-        return agent
-    url = discord_jump_url(
-        str(guild_id or ""),
-        str(agent.get("thread_id") or ""),
-        str(agent.get("chat_id") or ""),
-    )
-    if url:
-        agent["url"] = url
-    return agent
-
-
-def read_agents(path: Path, *, source_default: str) -> list[dict[str, Any]]:
-    """Read one state file, returning [] for anything missing or malformed."""
-    try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return []
-    if not isinstance(data, dict):
-        return []
-    raw = data.get("agents")
-    if not isinstance(raw, list):
-        return []
-
-    agents: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        raw_title = str(item.get("name") or item.get("title") or "").strip()
-        name = _clean_label(raw_title)
-        if not name:
-            continue
-        source = str(item.get("source") or source_default)
-        stamp = item.get("updated_at")
-        if stamp is None:
-            stamp = item.get("last_activity_at")
-        try:
-            updated_at = float(stamp) if stamp is not None else 0.0
-        except (TypeError, ValueError):
-            updated_at = 0.0
-        agents.append({
-            "name": name,
-            # Deck keys strip hyphens for the 12-char face. T3's sidebar still
-            # shows the original title, and that is the string the click must
-            # search for.
-            "title": raw_title,
-            "status": normalize_status(item.get("status")),
-            "source": source,
-            "cwd": str(item.get("cwd") or ""),
-            "url": str(item.get("url") or ""),
-            "web_url": str(item.get("web_url") or ""),
-            "thread_id": str(item.get("thread_id") or ""),
-            "chat_id": str(item.get("chat_id") or ""),
-            "session_id": str(item.get("session_id") or ""),
-            "cli_session_id": str(item.get("cli_session_id") or ""),
-            "environment_id": str(item.get("environment_id") or ""),
-            # For a remote terminal session this is the exact SSH alias used
-            # by the local watcher. It lets the Mac map the remote DB record to
-            # a Herdr pane whose foreground process is `ssh <alias>`.
-            "ssh_host": str(item.get("ssh_host") or ""),
-            "environment_label": str(item.get("environment_label") or ""),
-            # A surface id the agent named itself. Strongest signal there is:
-            # unlike a tty it needs no lookup, and unlike a cwd it identifies
-            # ONE tab rather than every tab open in the same directory.
-            "surface": str(item.get("surface") or ""),
-            # Herdr gives every pane a stable ID directly in the environment.
-            # It is exact and can be read back after `agent focus`.
-            "herdr_pane": str(item.get("herdr_pane") or ""),
-            "herdr_tab": str(item.get("herdr_tab") or ""),
-            "herdr_workspace": str(item.get("herdr_workspace") or ""),
-            # Recorded by the hook from inside the agent's own terminal. This is
-            # the only identifier that maps an agent to a cmux surface without
-            # guessing: titles are rewritten by whatever is running, and an
-            # agent's cwd need not appear in any title.
-            "tty": str(item.get("tty") or ""),
-            # The macOS application bundle the agent actually runs inside,
-            # recorded by the hook from its own process ancestry.  Claude Code
-            # and Codex also run in their DESKTOP apps, which have no tty and
-            # therefore no cmux surface: every terminal resolver misses them and
-            # the key silently does nothing.  This field is what makes those
-            # sessions reachable, and unlike a pgrep guess it names the host
-            # this specific agent belongs to.
-            "app": str(item.get("app") or ""),
-            # PID of the actual Claude/Codex ancestor, not the short-lived hook
-            # process. It lets the connector distinguish a quiet live session
-            # from a fresh-looking state record whose process has exited.
-            "agent_pid": item.get("agent_pid"),
-            "agent_started_at": str(item.get("agent_started_at") or ""),
-            "activity": str(item.get("last_activity") or ""),
-            "updated_at": updated_at,
-        })
-    return agents
-
-
-def workspace_identity(cwd: Any) -> str:
-    """Return a comparable workspace key, or empty when the path is too generic.
-
-    Cursor IDE hooks record ``~/.cursor/projects/<slash-path-with-hyphens>``
-    while T3 records the real repo path. Those must collapse to one identity.
-    Home directories and other two-component paths stay unmatched so a T3
-    thread at ``/home/hermes`` cannot swallow every Hermes CLI session.
-    """
-    raw = os.path.expanduser(str(cwd or "")).replace("\\", "/").rstrip("/")
-    if not raw:
-        return ""
-    lowered = raw.lower()
-    marker = "/.cursor/projects/"
-    if marker in lowered:
-        slug = lowered.split(marker, 1)[1].split("/", 1)[0]
-    else:
-        slug = lowered.lstrip("/").replace("/", "-")
-    if slug.count("-") < 2:
-        return ""
-    return slug
-
-
-def collapse_t3_shadows(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep the T3 thread when Hermes or a hook is watching the same session."""
-    t3 = [agent for agent in agents
-          if str(agent.get("source") or "").startswith("t3code")]
-    if not t3:
-        return agents
-    sessions = {
-        str(agent.get("session_id") or agent.get("thread_id") or "")
-        for agent in t3
-    }
-    sessions.discard("")
-    workspaces: dict[str, set[str]] = {}
-    for agent in t3:
-        identity = workspace_identity(agent.get("cwd"))
-        if not identity:
-            continue
-        workspaces.setdefault(identity, set()).add(str(agent.get("source") or ""))
-    out: list[dict[str, Any]] = []
-    for agent in agents:
-        source = str(agent.get("source") or "")
-        if source.startswith("t3code") or source.startswith("hermes-discord") \
-                or source.startswith("hermes-health"):
-            out.append(agent)
-            continue
-        session = str(agent.get("session_id") or agent.get("thread_id") or "")
-        if session and session in sessions:
-            continue
-        identity = workspace_identity(agent.get("cwd"))
-        owners = workspaces.get(identity, set())
-        if identity and owners:
-            if source == "hermes-ssh":
-                continue
-            if any(source in T3_SHADOW_SOURCES.get(owner, ()) for owner in owners):
-                continue
-        out.append(agent)
-    return out
-
-
-def collapse_claude_desktop_shadows(
-    agents: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Keep the desktop session when a hook is watching the same CLI id.
-
-    Claude Desktop's Code tab used to report through the CLI hook. Current
-    releases often skip that hook, so the desktop watcher reads the session
-    file. When an older release still fires the hook too, the two records are
-    one conversation: the desktop record owns the deep link, and a blocked
-    hook status is the stronger attention signal.
-    """
-    desktop = {
-        str(agent.get("cli_session_id") or ""): agent
-        for agent in agents
-        if str(agent.get("source") or "") == "claude-desktop"
-        and str(agent.get("cli_session_id") or "")
-    }
-    if not desktop:
-        return agents
-    out: list[dict[str, Any]] = []
-    for agent in agents:
-        if str(agent.get("source") or "") != "claude-code":
-            out.append(agent)
-            continue
-        owner = desktop.get(str(agent.get("session_id") or ""))
-        if owner is None:
-            out.append(agent)
-            continue
-        if agent.get("status") == "blocked":
-            owner["status"] = "blocked"
-        elif agent.get("status") == "working" and owner.get("status") != "blocked":
-            owner["status"] = "working"
-    return out
-
-
-def read_viewed(path: Path) -> list[dict[str, str]]:
-    """Read exact, ephemeral surface identities selected outside the deck."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    raw = data.get("viewed") if isinstance(data, dict) else None
-    if not isinstance(raw, list):
-        return []
-    fields = ("source", "url", "session_id", "thread_id", "surface",
-              "herdr_pane", "tty", "app", "unique_app")
-    return [
-        {field: str(item.get(field) or "") for field in fields}
-        for item in raw if isinstance(item, dict)
-    ]
-
-
-def read_pending_approvals(path: Path) -> list[dict[str, Any]]:
-    """Read Tirith prompts published by the Discord approval watcher."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    raw = data.get("pending") if isinstance(data, dict) else None
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, dict)]
-
-
-def _approval_thread_id(item: dict[str, Any]) -> str:
-    channel = str(item.get("channel_id") or "").strip()
-    if channel.isdigit():
-        return channel
-    _, target = discord_route_ids(str(item.get("url") or ""))
-    return target
-
-
-def apply_discord_approvals(
-    agents: list[dict[str, Any]], pending: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Promote matching Discord threads to blocked while a Tirith prompt waits.
-
-    Hermes session status is a heartbeat, not an approval feed. A finished
-    thread can still be sitting on Allow/Deny; that wait is the thing the
-    operator has not handled.
-    """
-    if not pending:
-        return agents
-    claimed: set[str] = set()
-    for agent in agents:
-        thread = str(agent.get("thread_id") or "").strip()
-        if not thread:
-            _, thread = discord_route_ids(str(agent.get("url") or ""))
-        if not thread or str(agent.get("source") or "") != "hermes-discord":
-            continue
-        matches = [
-            item for item in pending if _approval_thread_id(item) == thread
-        ]
-        if not matches:
-            continue
-        newest = max(matches, key=lambda item: float(item.get("created_ts") or 0))
-        agent["status"] = "blocked"
-        url = str(newest.get("url") or "")
-        if url:
-            agent["url"] = url
-        stamp = float(newest.get("created_ts") or 0.0)
-        if stamp > float(agent.get("updated_at") or 0.0):
-            agent["updated_at"] = stamp
-        claimed.add(thread)
-    for item in pending:
-        thread = _approval_thread_id(item)
-        if not thread or thread in claimed:
-            continue
-        claimed.add(thread)
-        command = " ".join(str(item.get("command") or "").split())
-        agents.append({
-            "name": short_label(command, thread) if command else "Approval",
-            "title": command or "Command Approval Required",
-            "status": "blocked",
-            "source": "hermes-discord",
-            "thread_id": thread,
-            "session_id": str(item.get("message_id") or ""),
-            "url": str(item.get("url") or ""),
-            "updated_at": float(item.get("created_ts") or 0.0),
-        })
-    return agents
-
-
-def manual_view_matches(
-    agent: dict[str, Any], view: dict[str, str], agents: list[dict[str, Any]],
-) -> bool:
-    """Require one strong selected-surface identity; never infer from a label."""
-    source = view.get("source", "")
-    if source and source != str(agent.get("source") or ""):
-        return False
-    for field in ("session_id", "thread_id", "surface", "herdr_pane", "tty"):
-        selected = view.get(field, "")
-        if selected:
-            return selected == str(agent.get(field) or "")
-    selected_url = view.get("url", "").rstrip("/")
-    agent_url = str(agent.get("url") or "").rstrip("/")
-    _, selected_target = discord_route_ids(selected_url)
-    if selected_target:
-        _, agent_target = discord_route_ids(agent_url)
-        if selected_target in {
-            agent_target,
-            str(agent.get("thread_id") or ""),
-            str(agent.get("chat_id") or ""),
-        }:
-            return True
-    if selected_url and agent_url:
-        # Discord may append a selected message id after the thread/channel.
-        return selected_url == agent_url or selected_url.startswith(agent_url + "/")
-    app = view.get("app", "")
-    if app and view.get("unique_app") == "1" and app == str(agent.get("app") or ""):
-        candidates = [a for a in agents if str(a.get("app") or "") == app]
-        precise = [a for a in candidates if not str(a.get("source") or "").endswith("-desktop")]
-        if precise:
-            # A generic desktop-window record may shadow the one hook-backed
-            # session. When exactly one precise session exists, viewing the app
-            # acknowledges both representations so the fallback cannot keep a
-            # duplicate NEEDS YOU key alive.
-            return len(precise) == 1 and agent in (precise[0], *[
-                a for a in candidates
-                if str(a.get("source") or "").endswith("-desktop")
-            ])
-        return len(candidates) == 1 and agent is candidates[0]
-    return False
-
-
-def decay_stale(agents: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
-    """Demote agents whose live status is contradicted by a silent heartbeat.
-
-    Hooks and watchers only publish on events, so a process killed mid-turn
-    leaves a permanently amber key.  A key stuck claiming work is happening is
-    worse than one that admits it does not know.
-    """
-    out = []
-    for agent in agents:
-        item = dict(agent)
-        stamp = item.get("updated_at") or 0.0
-        # T3 is polled continuously and its lifecycle flags are authoritative;
-        # a long turn may legitimately have no event timestamp for many
-        # minutes. The stale-heartbeat rule exists for event-only hook feeds.
-        authoritative = str(item.get("source") or "").startswith("t3code")
-        if (item["status"] in {"working", "blocked"} and stamp
-                and not authoritative
-                and not item.get("_verified_live")):
-            if now - stamp > STALE_WORKING_S:
-                item["status"] = "done"
-                item["activity"] = "stale"
-        out.append(item)
-    return out
-
-
-class LocalLivenessProbe:
-    """Bounded, cached proof of whether a local Claude/Codex process exists.
-
-    PID is checked immediately because the hook recorded the owning process
-    itself. Older pre-upgrade records have no PID; only once their heartbeat is
-    stale do we consult exact tty/surface/Herdr handles. Unknown is different
-    from dead: missing tools or unrecognised host metadata return ``None`` and
-    preserve timestamp fallback rather than falsely evicting a session.
-    """
-
-    def __init__(self, cache_seconds: float = LIVENESS_CACHE_S) -> None:
-        self.cache_seconds = max(0.0, float(cache_seconds))
-        self._cache: dict[str, tuple[float, tuple[object, ...], bool | None]] = {}
-        self._cmux_cache: tuple[float, dict[str, str] | None] = (0.0, None)
-
-    @staticmethod
-    def _run(argv: list[str]) -> subprocess.CompletedProcess[str] | None:
-        try:
-            return subprocess.run(
-                argv, capture_output=True, text=True, timeout=1.5, check=False,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return None
-
-    @staticmethod
-    def _expected_process(command: str, source: str) -> bool:
-        text = command.lower()
-        if any(name in text for name in (
-                "agent_shim.py", "claude_shim.py", "codex_shim.py",
-                "cursor_shim.py")):
-            return False
-        needles = {
-            "claude-code": ("claude",),
-            "codex-cli": ("codex",),
-            # Current Cursor CLI uses `agent`; cursor-agent remains its
-            # backwards-compatible name. IDE sessions usually have no
-            # per-conversation PID and stay timestamp driven instead.
-            "cursor-agent": ("agent", "cursor-agent", "cursor"),
-        }.get(source, ())
-        return any(os.path.basename(token.rstrip("/")) in needles
-                   for token in text.replace("=", " ").split()) \
-            or any(f"/{needle} " in text or f"/{needle}" == text.rstrip()
-                   for needle in needles)
-
-    def _pid_liveness(self, agent: dict[str, Any]) -> bool | None:
-        raw = agent.get("agent_pid")
-        if raw in (None, ""):
-            return None
-        try:
-            pid = int(raw)
-        except (TypeError, ValueError):
-            return False
-        if pid <= 1:
-            return False
-        result = self._run(["ps", "-p", str(pid), "-o", "command="])
-        if result is None:
-            return None
-        command = result.stdout.strip()
-        if result.returncode != 0 or not command:
-            return False
-        if not self._expected_process(command, str(agent.get("source") or "")):
-            return False
-        expected_start = str(agent.get("agent_started_at") or "")
-        if expected_start:
-            started = self._run(["ps", "-p", str(pid), "-o", "lstart="])
-            if started is None:
-                return None
-            if started.returncode != 0 or started.stdout.strip() != expected_start:
-                return False
-        return True
-
-    def _tty_liveness(self, agent: dict[str, Any], tty: str) -> bool | None:
-        tty = str(tty or "").strip().removeprefix("/dev/")
-        if not tty:
-            return None
-        result = self._run(["ps", "-t", tty, "-o", "command="])
-        if result is None:
-            return None
-        commands = result.stdout.strip()
-        if result.returncode != 0 or not commands:
-            return False
-        return self._expected_process(commands, str(agent.get("source") or ""))
-
-    def _cmux_surfaces(self, now: float) -> dict[str, str] | None:
-        expires, cached = self._cmux_cache
-        if now < expires:
-            return cached
-        result = self._run(["cmux", "--id-format", "both", "tree", "--all", "--json"])
-        surfaces: dict[str, str] | None = None
-        if result is not None and result.returncode == 0:
-            try:
-                data = json.loads(result.stdout)
-                surfaces = {}
-
-                def walk(value: object) -> None:
-                    if isinstance(value, dict):
-                        surface_id = str(value.get("id") or "")
-                        if surface_id and value.get("tty"):
-                            surfaces[surface_id] = str(value["tty"])
-                        for child in value.values():
-                            walk(child)
-                    elif isinstance(value, list):
-                        for child in value:
-                            walk(child)
-
-                walk(data)
-            except (TypeError, ValueError):
-                surfaces = None
-        self._cmux_cache = (now + self.cache_seconds, surfaces)
-        return surfaces
-
-    def _legacy_handle_liveness(
-        self, agent: dict[str, Any], now: float,
-    ) -> bool | None:
-        verdicts: list[bool | None] = []
-        tty = str(agent.get("tty") or "")
-        if tty:
-            verdicts.append(self._tty_liveness(agent, tty))
-
-        surface = str(agent.get("surface") or "")
-        if surface:
-            surfaces = self._cmux_surfaces(now)
-            if surfaces is None:
-                verdicts.append(None)
-            elif surface not in surfaces:
-                verdicts.append(False)
-            else:
-                verdicts.append(self._tty_liveness(agent, surfaces[surface]))
-
-        pane = str(agent.get("herdr_pane") or "")
-        if pane:
-            result = self._run(["herdr", "pane", "get", pane])
-            if result is None:
-                verdicts.append(None)
-            else:
-                try:
-                    data = json.loads(result.stdout)
-                except ValueError:
-                    verdicts.append(None if result.returncode == 0 else False)
-                else:
-                    if isinstance(data, dict) and data.get("error"):
-                        error = data.get("error")
-                        if (isinstance(error, dict)
-                                and error.get("code") == "pane_not_found"):
-                            verdicts.append(False)
-                        else:
-                            verdicts.append(None)
-                    else:
-                        pane_data = data.get("result", {}).get("pane", {}) \
-                            if isinstance(data, dict) else {}
-                        status = str(pane_data.get("agent_status") or "").lower()
-                        verdicts.append(
-                            True if status and status != "unknown" else None)
-
-        # Handle metadata is sticky across hooks because a detached hook may be
-        # unable to rediscover it.  Consequently one old handle can coexist
-        # with a newer exact one.  A single proven-live route wins; a session is
-        # dead only when every available probe conclusively says so.
-        if True in verdicts:
-            return True
-        if verdicts and all(verdict is False for verdict in verdicts):
-            return False
-        return None
-
-    def __call__(self, agent: dict[str, Any]) -> bool | None:
-        if agent.get("source") not in LOCAL_SESSION_SOURCES:
-            return None
-        now = time.monotonic()
-        token = tuple(agent.get(field) for field in (
-            "agent_pid", "agent_started_at", "tty", "surface", "herdr_pane",
-            "updated_at",
-        ))
-        key = agent_key(agent)
-        cached = self._cache.get(key)
-        if cached and now < cached[0] and token == cached[1]:
-            return cached[2]
-
-        verdict = self._pid_liveness(agent)
-        if verdict is None:
-            stamp = float(agent.get("updated_at") or 0.0)
-            # Fresh legacy hooks remain timestamp-driven. This avoids turning
-            # a transient CLI/permission failure into a false-dead key.
-            if stamp and time.time() - stamp <= STALE_WORKING_S:
-                verdict = None
-            else:
-                verdict = self._legacy_handle_liveness(agent, now)
-        self._cache[key] = (now + self.cache_seconds, token, verdict)
-        return verdict
-
-
-class HerdrSshPaneResolver:
-    """Conservatively map a remote Hermes record to its local Herdr SSH pane.
-
-    A remote Hermes session id names a database row on the SSH host; a Herdr
-    pane id names the visible terminal on this Mac.  They are intentionally
-    different namespaces.  The bridge is safe only when one single-pane Herdr
-    tab is running ``ssh <the watcher alias>`` and exactly one relevant remote
-    agent can own it. Ambiguity yields no route rather than the wrong tab.
-    """
-
-    SSH_OPTIONS_WITH_VALUE = frozenset({
-        "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i",
-        "-J", "-L", "-l", "-m", "-O", "-o", "-P", "-p", "-Q",
-        "-R", "-S", "-W", "-w",
-    })
-
-    def __init__(
-        self, *, runner: Any = subprocess.run,
-        herdr_bin: str = "herdr", cache_seconds: float = LIVENESS_CACHE_S,
-    ) -> None:
-        self.runner = runner
-        self.herdr_bin = herdr_bin
-        self.cache_seconds = max(0.0, float(cache_seconds))
-        self._cache: tuple[float, list[dict[str, str]]] = (0.0, [])
-
-    def _run_json(self, argv: list[str]) -> dict[str, Any] | None:
-        try:
-            result = self.runner(
-                argv, capture_output=True, text=True, timeout=1.5, check=False,
-            )
-            if result.returncode != 0:
-                return None
-            value = json.loads(result.stdout)
-            return value if isinstance(value, dict) else None
-        except (OSError, ValueError, subprocess.SubprocessError):
-            return None
-
-    @staticmethod
-    def _normal_host(value: object) -> str:
-        host = str(value or "").strip().casefold()
-        if "@" in host:
-            host = host.rsplit("@", 1)[1]
-        return host.strip("[]")
-
-    @classmethod
-    def _ssh_target(cls, argv: object) -> str:
-        if not isinstance(argv, list) or not argv:
-            return ""
-        if os.path.basename(str(argv[0])) != "ssh":
-            return ""
-        index = 1
-        while index < len(argv):
-            token = str(argv[index])
-            if token == "--":
-                index += 1
-                break
-            if not token.startswith("-") or token == "-":
-                break
-            if token in cls.SSH_OPTIONS_WITH_VALUE:
-                index += 2
-            else:
-                index += 1
-        if index >= len(argv):
-            return ""
-        return cls._normal_host(argv[index])
-
-    def _discover(self) -> list[dict[str, str]]:
-        now = time.monotonic()
-        expires, cached = self._cache
-        if now < expires:
-            return cached
-        document = self._run_json([self.herdr_bin, "pane", "list"])
-        raw = ((document or {}).get("result") or {}).get("panes") or []
-        panes = [item for item in raw if isinstance(item, dict)]
-        per_tab: dict[str, int] = {}
-        for pane in panes:
-            tab = str(pane.get("tab_id") or "")
-            if tab:
-                per_tab[tab] = per_tab.get(tab, 0) + 1
-
-        routes: list[dict[str, str]] = []
-        for pane in panes:
-            # A pane already owned by a local Herdr agent cannot simultaneously
-            # be the raw SSH viewer for a remote Hermes session.
-            if pane.get("agent"):
-                continue
-            pane_id = str(pane.get("pane_id") or "")
-            tab_id = str(pane.get("tab_id") or "")
-            workspace_id = str(pane.get("workspace_id") or "")
-            # Workspace + tab focus can select the exact pane only when that
-            # tab contains one pane. Split-pane ambiguity must remain unfocused.
-            if not pane_id or not tab_id or not workspace_id or per_tab.get(tab_id) != 1:
-                continue
-            info = self._run_json([
-                self.herdr_bin, "pane", "process-info", "--pane", pane_id,
-            ])
-            process_info = ((info or {}).get("result") or {}).get("process_info") or {}
-            processes = process_info.get("foreground_processes") or []
-            hosts = {
-                self._ssh_target(process.get("argv"))
-                for process in processes if isinstance(process, dict)
-            }
-            hosts.discard("")
-            if len(hosts) == 1:
-                routes.append({
-                    "ssh_host": next(iter(hosts)),
-                    "herdr_pane": pane_id,
-                    "herdr_tab": tab_id,
-                    "herdr_workspace": workspace_id,
-                })
-        self._cache = (now + self.cache_seconds, routes)
-        return routes
-
-    def enrich(self, agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out = [dict(agent) for agent in agents]
-        eligible = [
-            agent for agent in out
-            if agent.get("source") == "hermes-ssh"
-            and agent.get("ssh_host") and not agent.get("herdr_pane")
-        ]
-        if not eligible:
-            return out
-        routes = self._discover()
-        hosts = {self._normal_host(agent.get("ssh_host")) for agent in eligible}
-        for host in hosts:
-            host_agents = [
-                agent for agent in eligible
-                if self._normal_host(agent.get("ssh_host")) == host
-            ]
-            candidates = [route for route in routes if route["ssh_host"] == host]
-            if len(candidates) != 1:
-                continue
-            if len(host_agents) == 1:
-                owner = host_agents[0]
-            else:
-                active = [
-                    agent for agent in host_agents
-                    if agent.get("status") in {"working", "blocked"}
-                ]
-                if len(active) != 1:
-                    continue
-                owner = active[0]
-            owner.update(candidates[0])
-        return out
-
-
-def reconcile_local_liveness(
-    agents: list[dict[str, Any]], probe: Any,
-) -> list[dict[str, Any]]:
-    """Drop proven-dead sessions and tag proven-live sessions for decay."""
-    out: list[dict[str, Any]] = []
-    for agent in agents:
-        try:
-            verdict = probe(agent)
-        except Exception:
-            log.exception("local liveness probe failed for %s", agent.get("name"))
-            verdict = None
-        if verdict is False:
-            continue
-        item = dict(agent)
-        if verdict is True:
-            item["_verified_live"] = True
-        out.append(item)
-    return out
-
-
-def drop_uninteresting(
-    agents: list[dict[str, Any]], now: float, max_age_hours: float,
-) -> list[dict[str, Any]]:
-    """Keep live agents; drop idle ones and anything past the age cutoff."""
-    cutoff = now - max(0.0, max_age_hours) * 3600.0
-    out = []
-    for agent in agents:
-        if agent["status"] == "idle" and not agent.get("_verified_live"):
-            continue
-        stamp = agent.get("updated_at") or 0.0
-        if stamp and stamp < cutoff and not agent.get("_verified_live"):
-            continue
-        out.append(agent)
-    return out
-
-
-def dedupe_labels(agents: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Suffix repeated labels so two agents in one directory stay distinct.
-
-    The tool badge already differs, but a glyph is easy to miss at a glance,
-    so identical text gets a numeric suffix as well.
-    """
-    seen: dict[str, int] = {}
-    out = []
-    for agent in agents:
-        item = dict(agent)
-        base = item["name"]
-        key = base.lower()
-        seen[key] = seen.get(key, 0) + 1
-        if seen[key] > 1:
-            item["name"] = f"{base} {seen[key]}"
-        out.append(item)
-    return out
 
 
 class SlotMap:
@@ -1235,30 +446,34 @@ def face_for(agent: dict[str, Any], seen: bool = False) -> dict[str, Any]:
     needs_attention = status == "done" and not seen
     visual_status = "blocked" if needs_attention else status
     style = STATUS_FACE.get(visual_status, STATUS_FACE["idle"])
-    color, effect, icon = style["color"], style["effect"], style["icon"]
+    color, effect = style["color"], style["effect"]
     if seen:
-        # Dim the colour rather than change it: the status must still be
-        # readable at a glance, just quieter. Kill the animation outright,
-        # because a breathing key you have already answered is the exact thing
-        # that trains you to ignore a breathing key you have not.
+        # Dim rather than recolour, and stop animating: a breathing key you
+        # have already answered trains you to ignore one you have not.
         color = dim_hex(color, SEEN_DIM)
         effect = "solid"
-        icon = SEEN_ICON.get(icon, icon)
+    model = str(agent.get("model") or "")
+    sublabel = (
+        agent.get("notice_label")
+        or (STATUS_TEXT["blocked"] if status == "blocked" else "")
+        or models.short_name(model)
+        or (STATUS_TEXT["blocked"] if needs_attention
+            else STATUS_TEXT.get(status, status))
+    )
+    home = HOME_SOURCE.get(agent.get("source", ""), agent.get("source", ""))
     return {
-        "label": agent["name"][:12],
-        "sublabel": str(
-            agent.get("notice_label")
-            or (STATUS_TEXT["blocked"] if needs_attention
-                else STATUS_TEXT.get(status, status))
-        )[:16],
-        "badge": SOURCE_BADGE.get(agent.get("source", ""), ""),
-        # Source id travels with the face so renderers can draw the product
-        # logo.  The letter badge stays alongside it as the fallback for a
-        # machine where the SVGs cannot be rasterised.
-        "source": agent.get("source", ""),
-        "logo": logos.SOURCE_LOGO.get(agent.get("source", ""), ""),
+        "layout": "agent",
+        "label": agent["name"][:48],
+        "sublabel": str(sublabel)[:16],
+        "badge": SOURCE_BADGE.get(home, ""),
+        "source": home,
+        "logo": logos.SOURCE_LOGO.get(home, ""),
+        "model": model,
+        "provider": models.provider(model),
         "color": color,
-        "icon": icon,
+        # Colour and motion already say working or done; only a key that
+        # wants you spends pixels on an icon.
+        "icon": "alert" if visual_status == "blocked" else None,
         "effect": effect,
         "seen": seen,
     }
@@ -1359,253 +574,6 @@ def page_face(page: int, pages: int, hidden: int) -> dict[str, Any]:
     }
 
 
-CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CHROME_LOCAL_STATE = Path.home() / "Library/Application Support/Google/Chrome/Local State"
-# Chrome's OS window title is "<page> - Google Chrome - <profile>". A work
-# profile that is also a person is titled "Maanav (blackforestlabs.ai)", so
-# matching the configured profile name as an exact suffix misses every window
-# and the Gmail key opens another Gmail tab on every press.
-_CHROME_PROFILE_MARKER = " - Google Chrome - "
-
-
-def chrome_window_belongs_to_profile(window_name: str, profile_name: str) -> bool:
-    """True when a Chrome OS window title belongs to ``profile_name``."""
-    title = str(window_name or "")
-    profile = str(profile_name or "").strip()
-    if not title or not profile:
-        return False
-    marker = _CHROME_PROFILE_MARKER
-    if marker not in title:
-        return False
-    suffix = title.rsplit(marker, 1)[-1]
-    return suffix == profile or suffix.endswith(" (" + profile + ")")
-
-
-def chrome_titles_refer_to_same_window(chrome_title: str, os_title: str) -> bool:
-    """Pair a Chrome AppleScript window name with its System Events title.
-
-    Chrome truncates the tab title with an ellipsis; System Events keeps the
-    full OS title including the profile suffix. Index-zipping those two lists
-    is what made an already-open Gmail tab look missing.
-    """
-    chrome = str(chrome_title or "")
-    os_name = str(os_title or "")
-    if not chrome or not os_name:
-        return False
-    if os_name.startswith(chrome):
-        return True
-    if "…" in chrome:
-        head, tail = chrome.split("…", 1)
-        return os_name.startswith(head) and tail in os_name
-    return False
-
-
-#: A Notion page keeps one 32-hex id and rewrites everything around it: the
-#: same board is app.notion.com/p/<id>, www.notion.so/<slug>-<id>, and carries
-#: whichever ?v= and ?pvs= the last visit left behind. Matching the URL as a
-#: prefix therefore fails on the second press and opens the board again.
-_PAGE_ID_RE = re.compile(r"[0-9a-f]{32}")
-
-
-def chrome_tab_match_token(url: str) -> str:
-    """Return the substring that still identifies ``url`` after a rewrite."""
-    # Query string excluded: ?v= is a view id of the same shape, and matching
-    # that would call any view of the database the same page.
-    path = str(url or "").lower().split("?", 1)[0]
-    found = _PAGE_ID_RE.findall(path)
-    return found[-1] if found else ""
-
-
-def chrome_tab_matches_url(tab_url: str, target: str) -> bool:
-    """True when an open tab is the destination, including Gmail hash routes."""
-    tab = str(tab_url or "").strip()
-    want = str(target or "").strip()
-    if not tab or not want:
-        return False
-    if tab.startswith(want):
-        return True
-    tab_base = tab.split("#", 1)[0].rstrip("/")
-    want_base = want.split("#", 1)[0].rstrip("/")
-    if tab_base == want_base or tab_base.startswith(want_base + "/"):
-        return True
-    if "mail.google.com/mail" in want and "mail.google.com/mail" in tab:
-        return True
-    token = chrome_tab_match_token(want)
-    if token and token in tab.lower():
-        return True
-    return False
-
-
-_CHROME_RAISE_SCRIPT = r'''
-on run argv
-    set profileName to item 1 of argv
-    set profileSuffix to " - Google Chrome - " & profileName
-    set profileParen to " (" & profileName & ")"
-    tell application "System Events"
-        if exists process "Google Chrome" then
-            tell process "Google Chrome"
-                repeat with windowRef in windows
-                    try
-                        set windowName to name of windowRef as text
-                        if windowName ends with profileSuffix or windowName ends with profileParen then
-                            perform action "AXRaise" of windowRef
-                            set frontmost to true
-                            return "focused"
-                        end if
-                    end try
-                end repeat
-            end tell
-        end if
-    end tell
-    return "missing"
-end run
-'''
-_CHROME_TAB_SCRIPT = r'''
-on run argv
-    set profileName to item 1 of argv
-    set targetUrl to item 2 of argv
-    set matchToken to item 3 of argv
-    set profileSuffix to " - Google Chrome - " & profileName
-    set profileParen to " (" & profileName & ")"
-    tell application "System Events"
-        if not (exists process "Google Chrome") then return "missing"
-        tell process "Google Chrome"
-            set osNames to name of windows
-        end tell
-    end tell
-    tell application "Google Chrome"
-        if (count of windows) is 0 then return "missing"
-        set profileId to 0
-        set fallbackWinId to 0
-        set fallbackTabIndex to 0
-        repeat with w in windows
-            set chromeTitle to name of w as text
-            set isProfile to false
-            repeat with osNameRef in osNames
-                set osName to osNameRef as text
-                if osName ends with profileSuffix or osName ends with profileParen then
-                    if osName starts with chromeTitle then
-                        set isProfile to true
-                    else if chromeTitle contains "…" then
-                        set AppleScript's text item delimiters to "…"
-                        set parts to text items of chromeTitle
-                        set AppleScript's text item delimiters to ""
-                        if (count of parts) is 2 then
-                            if osName starts with (item 1 of parts) and osName contains (item 2 of parts) then
-                                set isProfile to true
-                            end if
-                        end if
-                    end if
-                end if
-                if isProfile then exit repeat
-            end repeat
-            if isProfile and profileId is 0 then set profileId to id of w
-            set tabIndex to 0
-            repeat with t in tabs of w
-                set tabIndex to tabIndex + 1
-                try
-                    set tabUrl to URL of t as text
-                    set matched to false
-                    if tabUrl starts with targetUrl then set matched to true
-                    if targetUrl contains "mail.google.com" and tabUrl contains "mail.google.com/mail" then set matched to true
-                    if matchToken is not "" and tabUrl contains matchToken then set matched to true
-                    if matched then
-                        if isProfile then
-                            set active tab index of w to tabIndex
-                            set index of w to 1
-                            activate
-                            return "focused-tab"
-                        end if
-                        if fallbackWinId is 0 then
-                            set fallbackWinId to id of w
-                            set fallbackTabIndex to tabIndex
-                        end if
-                    end if
-                end try
-            end repeat
-        end repeat
-        if fallbackWinId is not 0 then
-            set active tab index of window id fallbackWinId to fallbackTabIndex
-            set index of window id fallbackWinId to 1
-            activate
-            return "focused-tab"
-        end if
-        if profileId is 0 then return "missing"
-        tell window id profileId to make new tab with properties {URL:targetUrl}
-        set index of window id profileId to 1
-        activate
-        return "new-tab"
-    end tell
-end run
-'''
-
-
-def lookup_chrome_profile_name(profile: str) -> str:
-    """Return Chrome's visible profile name for a profile directory.
-
-    Window titles use the display name, not ``Default`` / ``Profile 1``. Reading
-    Local State keeps Gmail's work-window match working without duplicating
-    that name in config.
-    """
-    directory = str(profile or "").strip()
-    if not directory:
-        return ""
-    try:
-        payload = json.loads(CHROME_LOCAL_STATE.read_text(encoding="utf-8"))
-        cache = payload.get("profile", {}).get("info_cache", {})
-        info = cache.get(directory) if isinstance(cache, dict) else None
-        if isinstance(info, dict):
-            return str(info.get("name") or "").strip()
-    except (OSError, ValueError, TypeError):
-        return ""
-    return ""
-
-
-def raise_chrome_profile_window(profile_name: str) -> bool:
-    """Raise an existing Chrome window for ``profile_name``, if one is open."""
-    name = str(profile_name or "").strip()
-    if not name:
-        return False
-    try:
-        focused = subprocess.run(
-            ["/usr/bin/osascript", "-e", _CHROME_RAISE_SCRIPT, name],
-            check=False, capture_output=True, text=True, timeout=3,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("Chrome profile focus failed for %s: %s", name, exc)
-        return False
-    if focused.returncode == 0 and focused.stdout.strip() == "focused":
-        log.info("focused Chrome profile window: %s", name)
-        return True
-    return False
-
-
-def open_or_focus_chrome_tab(profile_name: str, url: str) -> bool:
-    """Focus a matching tab in this Chrome profile, or open one if none exist.
-
-    Searches every window of the profile. Opening a new Gmail tab is reserved
-    for the case where that profile has windows but no Gmail at all.
-    """
-    name = str(profile_name or "").strip()
-    target = str(url or "").strip()
-    if not name or not target:
-        return False
-    try:
-        result = subprocess.run(
-            ["/usr/bin/osascript", "-e", _CHROME_TAB_SCRIPT, name, target,
-             chrome_tab_match_token(target)],
-            check=False, capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log.warning("Chrome tab open failed for %s: %s", target, exc)
-        return False
-    status = (result.stdout or "").strip()
-    if result.returncode == 0 and status in ("focused-tab", "new-tab"):
-        log.info("Chrome tab %s for %s", status, target)
-        return True
-    return False
-
-
 class AgentConnector:
     """Poll both agent feeds and paint one inclusive deckd key range."""
 
@@ -1620,6 +588,7 @@ class AgentConnector:
         focus_cmd: str = DEFAULT_FOCUS_CMD,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
+        rest_hours: float = DEFAULT_REST_HOURS,
         name: str = "agents",
         apps_config: str | os.PathLike[str] = DEFAULT_APPS_CONFIG,
         launch_cmd: str = DEFAULT_LAUNCH_CMD,
@@ -1657,7 +626,8 @@ class AgentConnector:
         )
         self.focus_cmd = focus_cmd
         self.poll_interval = poll_interval
-        self.max_age_hours = max_age_hours
+        self.max_age_s = max(0.0, max_age_hours) * 3600.0
+        self.rest_s = max(0.0, rest_hours) * 3600.0
         self.name = name
         self.apps_config = Path(os.path.expanduser(os.fspath(apps_config)))
         self.launch_cmd = launch_cmd
@@ -1760,7 +730,7 @@ class AgentConnector:
         agents = collapse_t3_shadows(agents)
         agents = collapse_claude_desktop_shadows(agents)
         agents = decay_stale(agents, current)
-        agents = drop_uninteresting(agents, current, self.max_age_hours)
+        agents = drop_unverified_idle(agents)
         agents = apply_discord_approvals(
             agents, read_pending_approvals(self.approvals_state),
         )
@@ -1768,26 +738,29 @@ class AgentConnector:
         for view in read_viewed(self.desktop_state):
             for agent in agents:
                 if manual_view_matches(agent, view, agents):
-                    self.mark_seen(agent)
-        # Forget acknowledgements whose heartbeat is older than the board's
-        # own age cutoff.  Do not forget them merely because the agent left
+                    self.mark_seen(agent, at=current)
+        # Forget old acknowledgements, but not merely because the agent left
         # this poll: Hermes ranking can drop a finished thread for one cycle
-        # and put it back with the same heartbeat, which used to resurrect
-        # every long-pressed Discord key.
-        cutoff = current - max(0.0, self.max_age_hours) * 3600.0
+        # and put it back with the same heartbeat.
+        cutoff = current - self.max_age_s - self.rest_s
         expired = False
         for store in (self._seen, self._dismissed):
-            for key in [k for k, token in store.items()
-                        if token[1] and token[1] < cutoff]:
+            for key in [k for k, ack in store.items()
+                        if max(ack.stamp, ack.at) < cutoff]:
                 del store[key]
                 expired = True
         if expired:
             self._persist_acks()
-        # A long-pressed agent leaves the board until it does something new.
-        # Viewing a Discord completion is not a dismissal: it settles to the
-        # quiet done face so the thread stays a jump target. Overflow is the
-        # pager's job, not an implicit drop of anything the operator opened.
-        return [agent for agent in agents if not self._is_dismissed(agent)]
+        return [agent for agent in agents
+                if not self._is_dismissed(agent)
+                and not self._expired(agent, current)]
+
+    def expires_at(self, agent: dict[str, Any]) -> float | None:
+        return expires_at(agent, self._seen_at(agent), self.max_age_s, self.rest_s)
+
+    def _expired(self, agent: dict[str, Any], now: float) -> bool:
+        deadline = self.expires_at(agent)
+        return deadline is not None and deadline <= now
 
     def build_faces(self, agents: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
         """Map every claimed key to a face, pinning agents to their slots."""
@@ -1880,9 +853,7 @@ class AgentConnector:
         """
         return (str(agent.get("status", "")), _ack_stamp(agent.get("updated_at")))
 
-    def _ack_covers(
-        self, stored: tuple[str, float] | None, agent: dict[str, Any],
-    ) -> bool:
+    def _ack_covers(self, stored: Ack | None, agent: dict[str, Any]) -> bool:
         """True when ``stored`` still accounts for the agent's current event.
 
         A later, *less* urgent status on the same heartbeat is the same turn
@@ -1900,12 +871,16 @@ class AgentConnector:
         """Has this agent been acknowledged as it stands RIGHT NOW?"""
         return self._ack_covers(self._seen.get(agent_key(agent)), agent)
 
-    def mark_seen(self, agent: dict[str, Any]) -> None:
+    def _seen_at(self, agent: dict[str, Any]) -> float | None:
+        ack = self._seen.get(agent_key(agent))
+        return ack.at if self._ack_covers(ack, agent) else None
+
+    def mark_seen(self, agent: dict[str, Any], at: float | None = None) -> None:
         key = agent_key(agent)
         existing = self._seen.get(key)
         if existing is not None and self._ack_covers(existing, agent):
             return
-        self._seen[key] = self._ack_token(agent)
+        self._seen[key] = Ack(*self._ack_token(agent), time.time() if at is None else at)
         self._persist_acks()
 
     def dismiss(self, agent: dict[str, Any]) -> None:
@@ -1918,7 +893,7 @@ class AgentConnector:
         key = agent_key(agent)
         existing = self._dismissed.get(key)
         if existing is None or not self._ack_covers(existing, agent):
-            self._dismissed[key] = self._ack_token(agent)
+            self._dismissed[key] = Ack(*self._ack_token(agent), time.time())
         self._slots.remove_and_compact(key)
         self._persist_acks()
 
@@ -2209,6 +1184,13 @@ class AgentConnector:
         )
 
 
+def lifetime(deadline: float | None, now: float) -> str:
+    if deadline is None:
+        return "stays while active"
+    minutes = max(0, int((deadline - now) // 60))
+    return f"leaves in {minutes // 60}h{minutes % 60:02d}m"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=DEFAULT_HOST)
@@ -2227,7 +1209,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--apps-config", default=DEFAULT_APPS_CONFIG)
     parser.add_argument("--launch-cmd", default=DEFAULT_LAUNCH_CMD)
     parser.add_argument("--poll-interval", type=float, default=DEFAULT_POLL_INTERVAL)
-    parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
+    parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS,
+                        help="unseen results stay this long")
+    parser.add_argument("--rest-hours", type=float, default=DEFAULT_REST_HOURS,
+                        help="seen results and idle sessions stay this long after you look")
     parser.add_argument("--name", default="agents")
     parser.add_argument(
         "--once", action="store_true",
@@ -2253,6 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
         focus_cmd=args.focus_cmd,
         poll_interval=args.poll_interval,
         max_age_hours=args.max_age_hours,
+        rest_hours=args.rest_hours,
         name=args.name,
         apps_config=args.apps_config,
         launch_cmd=args.launch_cmd,
@@ -2260,12 +1246,14 @@ def main(argv: list[str] | None = None) -> int:
         hermes_health=default_health_path("hermes_agents"),
     )
     if args.once:
-        faces = connector.build_faces(connector.collect())
+        now = time.time()
+        faces = connector.build_faces(connector.collect(now))
         for index, face in sorted(faces.items()):
-            badge = face.get("badge") or " "
-            label = face.get("label") or ""
-            sub = face.get("sublabel") or ""
-            print(f"key {index:>2}  [{badge}] {label:<13} {sub:<11} {face['color']}  {face['effect']}")
+            agent = connector._agent_keys.get(index)
+            line = f"key {index:>2}  {face.get('label') or '':<13} {face.get('sublabel') or '':<13}"
+            if agent is not None:
+                line += f" {agent['status']:<8} {agent.get('model') or '-':<22} {lifetime(connector.expires_at(agent), now)}"
+            print(line.rstrip())
         return 0
     try:
         asyncio.run(connector.run())

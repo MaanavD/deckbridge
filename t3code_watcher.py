@@ -65,11 +65,18 @@ token_path="$HOME/.deckbridge/t3code_token"
 if [ -s "$token_path" ]; then
   exit 0
 fi
-node="${HOME}/.hermes/node/bin/node"
-[ -x "$node" ] || node=$(command -v node)
-cli=$(ls -1d "$HOME"/.t3/runtime/versions/*/node_modules/t3/dist/bin.mjs 2>/dev/null | tail -n 1)
-[ -n "$node" ] && [ -n "$cli" ] || exit 1
-token=$("$node" "$cli" auth session issue --ttl 3650d --label Deckbridge --subject deckbridge-remote --token-only)
+# Current headless installs ship a versioned t3 binary. Older installs ran
+# the same CLI through node and bin.mjs.
+cli=$(ls -1d "$HOME"/.t3/runtime/versions/*/t3 2>/dev/null | tail -n 1 || true)
+if [ -n "$cli" ] && [ -x "$cli" ]; then
+  token=$("$cli" auth session issue --ttl 3650d --label Deckbridge --subject deckbridge-remote --token-only)
+else
+  node="${HOME}/.hermes/node/bin/node"
+  [ -x "$node" ] || node=$(command -v node)
+  cli=$(ls -1d "$HOME"/.t3/runtime/versions/*/node_modules/t3/dist/bin.mjs 2>/dev/null | tail -n 1 || true)
+  [ -n "$node" ] && [ -n "$cli" ] || exit 1
+  token=$("$node" "$cli" auth session issue --ttl 3650d --label Deckbridge --subject deckbridge-remote --token-only)
+fi
 [ -n "$token" ] || exit 1
 umask 077
 printf '%s\n' "$token" > "$token_path.tmp"
@@ -143,7 +150,7 @@ def snapshot_agents(payload: dict[str, Any], origin: str, environment_id: str) -
     for thread in payload.get("threads", []):
         if not isinstance(thread, dict) or thread.get("archivedAt"):
             continue
-        if thread_is_settled(thread):
+        if thread_is_settled(thread) or iso_epoch(thread.get("snoozedUntil")) > time.time():
             continue
         thread_id = str(thread.get("id") or "")
         if not thread_id:
@@ -158,6 +165,7 @@ def snapshot_agents(payload: dict[str, Any], origin: str, environment_id: str) -
             "name": str(thread.get("title") or "New thread"),
             "status": thread_status(thread),
             "source": provider_source(thread),
+            "model": str((thread.get("modelSelection") or {}).get("model") or ""),
             "session_id": thread_id,
             "thread_id": thread_id,
             "environment_id": environment_id,
@@ -258,6 +266,7 @@ class T3CodeWatcher:
         )
         self._reissued_local = False
         self._issued_remote = False
+        self._remote_token_retry_at = 0.0
 
     def endpoint(self) -> tuple[str, str]:
         doc = json.loads(self.runtime.read_text(encoding="utf-8"))
@@ -388,9 +397,11 @@ class T3CodeWatcher:
         return document if isinstance(document, dict) else None
 
     def ensure_remote_token(self) -> None:
-        if self._issued_remote or not self.ssh_host:
+        if not self.ssh_host or self._issued_remote:
             return
-        self._issued_remote = True
+        now = time.time()
+        if now < self._remote_token_retry_at:
+            return
         try:
             completed = self.opener(
                 self.ssh_command("bash", "-s"),
@@ -398,10 +409,13 @@ class T3CodeWatcher:
                 input=REMOTE_ISSUE_TOKEN,
             )
         except (OSError, subprocess.SubprocessError) as exc:
+            self._remote_token_retry_at = time.time() + 30
             raise RuntimeError(f"could not issue a T3 token on {self.ssh_host}: {exc}") from exc
         if completed.returncode != 0:
+            self._remote_token_retry_at = time.time() + 30
             detail = (completed.stderr or completed.stdout or "").strip() or "token issue failed"
             raise RuntimeError(f"could not issue a T3 token on {self.ssh_host}: {detail}")
+        self._issued_remote = True
 
     def poll_once(self) -> list[dict[str, Any]]:
         errors: list[Exception] = []

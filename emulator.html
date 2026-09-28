@@ -56,6 +56,18 @@
   .key.mark-lg .logo { width:26px; height:26px; clip-path: inset(1px); }
   .key.logo-only.mark-lg .logo { width:58px; height:58px; clip-path:none; }
   .key.off .logo { opacity:.12; }
+  /* Opposite corner: the lab whose model is answering. */
+  /* Agent keys: alert top-left only when needed, two-line task name, and the
+     lab mark inline with the model on the bottom line. */
+  .key.agent .idx { display:none; }
+  .key.agent .icon { position:absolute; top:5px; left:6px; width:20px; height:20px; margin:0; }
+  .key.agent .label { font-family:"Arial Narrow", sans-serif; font-size:15px; line-height:16px; display:-webkit-box;
+      -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; margin-top:8px; }
+  .key.agent .sub { position:absolute; left:3px; right:3px; bottom:6px;
+      display:flex; align-items:center; justify-content:center; gap:3px; white-space:nowrap; }
+  .key.agent .subtext { line-height:1; text-box:trim-both cap alphabetic; }
+  .key .provider { width:12px; height:12px; flex:none;
+      filter: drop-shadow(0 1px 2px rgba(0,0,0,.9)); }
   /* Letter badge, kept only for a source with no logo file. */
   .key .badge { position:absolute; top:4px; right:5px; font-size:13px;
                 font-weight:900; line-height:1; padding:1px 5px; border-radius:5px;
@@ -120,12 +132,17 @@
   </div>
 </div>
 <script>
-// deckbridge-emulator-build: 2026-08-07.logo-motion
+// deckbridge-emulator-build: 2026-09-27.agent-layout
 // Probed by deckbridge.sh to tell THIS checkout's emulator from a stale
 // http.server left running in some other directory, which would otherwise
 // answer 404 (or worse, serve old JavaScript) and look like a broken deck.
 const params = new URLSearchParams(location.search);
 const WS = params.get("ws") || "ws://127.0.0.1:8777";
+// A logo/icon filename does not change when the artwork behind it does, so a
+// plain reload kept serving the old bitmap from cache (an <img> is not
+// re-fetched while its src string is unchanged). A per-load token makes every
+// refresh revalidate the assets, so a reinstall shows the new marks at once.
+const ASSET_VERSION = Date.now().toString(36);
 const grid = document.getElementById("grid");
 const statusEl = document.getElementById("status");
 let keyEls = [], cols = 5;
@@ -142,7 +159,7 @@ function build(keys, gridDims){
     // that comes off the wire is written with textContent or setAttribute
     // below, never as markup.
     k.innerHTML = `<span class="idx">${i}</span>
-      <img class="logo" alt="" hidden><span class="badge"></span><span class="notification"></span><img class="icon" alt="" hidden><span class="label"></span><span class="sub"></span>`;
+      <img class="logo" alt="" hidden><span class="badge"></span><span class="notification"></span><img class="icon" alt="" hidden><span class="label"></span><span class="sub"><img class="provider" alt="" hidden><span class="subtext"></span></span>`;
     k.addEventListener("mousedown", ()=>send({type:"press",index:i}));
     k.addEventListener("mouseup",   ()=>send({type:"release",index:i}));
     k.addEventListener("mouseleave",e=>{ if(e.buttons) send({type:"release",index:i}); });
@@ -161,6 +178,7 @@ function paint(faces){
       (bigMark ? " motion-hermes" : ""));
     k.className = "key" + (off?" off":"") + (bigMark?" mark-lg":"") +
       (f.layout==="logo-only"?" logo-only":"") +
+      (f.layout==="agent"?" agent":"") +
       (f.layout==="icon-action"?" icon-action":"") +
       (workingStatus?" status-working":"") + sourceMotion +
       (f.effect==="breathe"?" fx-breathe":"") + (f.effect==="blink"?" fx-blink":"") +
@@ -173,7 +191,7 @@ function paint(faces){
     // pictures for the same state, and neither matched the logos.
     const iconEl = k.querySelector(".icon");
     if (f.icon) {
-      const isrc = `icons/${f.icon}.svg`;
+      const isrc = `icons/${f.icon}.svg?v=${ASSET_VERSION}`;
       iconEl.onerror = () => { iconEl.hidden = true; };
       iconEl.hidden = false;
       if (iconEl.getAttribute("src") !== isrc) iconEl.setAttribute("src", isrc);
@@ -194,7 +212,7 @@ function paint(faces){
     };
     const file = f.logo || (f.source ? `${f.source}.svg` : "");
     if (file) {
-      const src = `logos/${file}`;
+      const src = `logos/${file}?v=${ASSET_VERSION}`;
       logoEl.onerror = () => {
         console.warn(`deckbridge: missing logo ${src} for source '${f.source}'`);
         showBadge();
@@ -206,8 +224,16 @@ function paint(faces){
     } else {
       showBadge();
     }
-    k.querySelector(".label").textContent = f.label || "";
-    k.querySelector(".sub").textContent   = f.sublabel || "";
+    const providerEl = k.querySelector(".provider");
+    const providerSrc = f.provider ? `logos/providers/${f.provider}.svg?v=${ASSET_VERSION}` : "";
+    providerEl.hidden = !providerSrc;
+    providerEl.onerror = () => { providerEl.hidden = true; };
+    if (providerSrc && providerEl.getAttribute("src") !== providerSrc)
+      providerEl.setAttribute("src", providerSrc);
+    k.title = f.model || "";
+    const labelEl = k.querySelector(".label");
+    labelEl.textContent = f.label || "";
+    k.querySelector(".subtext").textContent = f.sublabel || "";
     const notificationEl = k.querySelector(".notification");
     const notificationCount = Math.max(0, Number(f.notification_count) || 0);
     notificationEl.textContent = notificationCount > 99 ? "99+" : String(notificationCount || "");

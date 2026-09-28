@@ -77,8 +77,11 @@ def main() -> int:
           [ssh_cmd[i + 1] for i, a in enumerate(ssh_cmd) if a == "--source"]
           == ["cli", "tui"], " ".join(ssh_cmd))
     check("--all is forwarded to the probe", "--all" in ssh_cmd)
-    check("ssh argv runs the remote probe path",
-          watcher.DEFAULT_REMOTE_PROBE in ssh_cmd, " ".join(ssh_cmd))
+    check("ssh argv streams this checkout's probe over stdin",
+          ssh_cmd[ssh_cmd.index("python3") + 1] == "-", " ".join(ssh_cmd))
+    pinned = watcher.parse_args(["--ssh", "hetzner", "--remote-probe", "/opt/probe.py"])
+    check("an explicit remote probe path still runs that file",
+          "/opt/probe.py" in watcher.build_command(pinned))
     check("ssh argv is shell-free",
           not any(any(c in part for c in ";|&") for part in ssh_cmd), " ".join(ssh_cmd))
 

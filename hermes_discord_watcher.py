@@ -42,9 +42,11 @@ DISCORD_API = "https://discord.com/api/v10"
 DISCORD_USER_AGENT = "DiscordBot (https://example.com, 1.0)"
 DEFAULT_STATE_PATH = Path("~/.deckbridge/hermes_approvals.json").expanduser()
 DEFAULT_AGENTS_PATH = Path("~/.deckbridge/hermes_agents.json").expanduser()
-APPROVAL_TITLE = "Command Approval Required"
-INPUT_TITLE = "needs your input"
-EXPIRED_MARKER = "Approval expired"
+#: Phrases Hermes has used on prompts that wait for the operator. It renamed
+#: "Command Approval Required" to "... needs your OK", so match several.
+BLOCKER_MARKERS = ("command approval required", "needs your input", "needs your ok")
+EXPIRED_MARKERS = ("approval expired", "prompt expired", "selection expired")
+LINK_BUTTON_STYLE = 5
 # Forum/home-channel polls never see Tirith prompts; those live in the agent
 # thread. Cap extra scans so one poll cannot fan out across the whole guild.
 MAX_THREAD_SCANS = 12
@@ -215,12 +217,13 @@ def _created_ts(message: dict[str, Any]) -> float:
 def _looks_like_blocker(title: str, body: str) -> bool:
     """True for Tirith approval and input prompts, including emoji prefixes."""
     blob = f"{title}\n{body}".casefold()
-    if EXPIRED_MARKER.casefold() in blob:
+    if any(marker in blob for marker in EXPIRED_MARKERS):
         return False
-    return APPROVAL_TITLE.casefold() in blob or INPUT_TITLE in blob
+    return any(marker in blob for marker in BLOCKER_MARKERS)
 
 
 def _action_buttons(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Buttons that do something in Discord; link buttons just open a URL."""
     buttons: list[dict[str, Any]] = []
     for row in message.get("components") or []:
         if not isinstance(row, dict):
@@ -230,9 +233,10 @@ def _action_buttons(message: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             try:
                 ctype = int(component.get("type") or 0)
+                style = int(component.get("style") or 0)
             except (TypeError, ValueError):
                 continue
-            if ctype == BUTTON_COMPONENT:
+            if ctype == BUTTON_COMPONENT and style != LINK_BUTTON_STYLE:
                 buttons.append(component)
     return buttons
 
@@ -279,34 +283,33 @@ def approval_from_message(
     if not message_id or not _still_waiting(message):
         return None
     embeds = [item for item in (message.get("embeds") or []) if isinstance(item, dict)]
-    if not embeds and _looks_like_blocker("", str(message.get("content") or "")):
-        embeds = [{"title": "", "description": str(message.get("content") or "")}]
-    for embed in embeds:
-        title = str(embed.get("title") or "")
-        body = _embed_text(embed)
-        if not _looks_like_blocker(title, body):
-            continue
+    content = str(message.get("content") or "")
+    footers = [str((e.get("footer") or {}).get("text") or "") for e in embeds]
+    text = "\n".join([content, *map(_embed_text, embeds), *footers])
+    if not _looks_like_blocker("", text):
+        return None
 
-        description = str(embed.get("description") or "")
-        command = _field_value(embed, "Requested command")
-        if not command:
-            command = _description_value(description, "Requested command", "Reason")
-        reason = _field_value(embed, "Reason")
-        if not reason:
-            reason = _description_value(description, "Reason")
+    command = next((_field_value(e, "Requested command") for e in embeds
+                    if _field_value(e, "Requested command")), "")
+    reason = next((_field_value(e, "Reason") for e in embeds
+                   if _field_value(e, "Reason")), "")
+    fenced = re.search(r"Requested command\W*```[^\n]*\n(.*?)```", text, re.DOTALL)
+    command = command or (fenced.group(1).strip() if fenced else "") \
+        or _description_value(text, "Requested command", "Reason")
+    why = re.search(r"(?:Reason|Why it was flagged)\**\s*:\**\s*(.+)", text)
+    reason = reason or (why.group(1).strip() if why else "")
 
-        guild = str(message.get("guild_id") or configured_guild)
-        url_guild = guild or "@me"
-        return {
-            "message_id": message_id,
-            "channel_id": channel_id,
-            "guild_id": guild,
-            "command": command,
-            "reason": reason,
-            "created_ts": _created_ts(message),
-            "url": f"https://discord.com/channels/{url_guild}/{channel_id}/{message_id}",
-        }
-    return None
+    guild = str(message.get("guild_id") or configured_guild)
+    url_guild = guild or "@me"
+    return {
+        "message_id": message_id,
+        "channel_id": channel_id,
+        "guild_id": guild,
+        "command": command,
+        "reason": reason,
+        "created_ts": _created_ts(message),
+        "url": f"https://discord.com/channels/{url_guild}/{channel_id}/{message_id}",
+    }
 
 
 def collect_pending(

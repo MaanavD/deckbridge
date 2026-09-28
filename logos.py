@@ -12,8 +12,8 @@ Two consumers, one source of truth in ``logos/``:
   already serves it from this directory, so filenames are deliberately the
   source ids verbatim and no mapping is duplicated in JavaScript.
 
-The SVGs are Simple Icons (CC0) plus project-drawn glyphs for integrations
-without a published icon. All are single-path 24x24 monochrome, so
+The SVGs are Simple Icons (CC0), Dashboard Icons, plus project-drawn glyphs
+for integrations without a published icon. All are single-colour, so
 recolouring is a fill swap rather than an image operation.
 
 cairosvg is optional on purpose. The Mac may not have a working libcairo, and
@@ -196,7 +196,10 @@ def load(source: str, size: int = 18, colour: str = "#ffffff") -> Any | None:
     name = SOURCE_LOGO.get(source)
     if name and name.lower().endswith(".png"):
         return _load_png(source, size)
-    svg = _svg_text(source)
+    return _rasterise(_svg_text(source), size, colour)
+
+
+def _rasterise(svg: str | None, size: int, colour: str) -> Any | None:
     if not svg:
         return None
     _expose_homebrew_cairo()
@@ -216,6 +219,33 @@ def load(source: str, size: int = 18, colour: str = "#ffffff") -> Any | None:
         return Image.open(io.BytesIO(png)).convert("RGBA")
     except Exception:
         return None
+
+
+# --- model providers ------------------------------------------------------
+#
+# The corner mark names the harness (Claude Code, Codex, T3). The opposite
+# corner names the lab whose model is answering. Marks are Lobe Icons (MIT)
+# and Simple Icons (CC0), stored as ``logos/providers/<provider id>.svg``.
+
+PROVIDER_DIR = os.path.join(LOGO_DIR, "providers")
+
+
+def provider_path(provider: str) -> str | None:
+    path = os.path.join(PROVIDER_DIR, f"{provider}.svg")
+    return path if provider and os.path.exists(path) else None
+
+
+@functools.lru_cache(maxsize=64)
+def load_provider(provider: str, size: int = 16, colour: str = "#ffffff") -> Any | None:
+    path = provider_path(provider)
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            svg = handle.read()
+    except OSError:
+        return None
+    return _rasterise(svg, size, colour)
 
 
 def _load_image_path(path: str, size: int) -> Any | None:

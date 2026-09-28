@@ -30,14 +30,15 @@ log = logging.getLogger("deckd")
 OFF_FACE = {
     "label": "", "sublabel": "", "badge": "", "source": "", "logo": "",
     "color": "#111111", "icon": None, "effect": "off", "seen": False,
-    "layout": "status", "notification_count": 0,
+    "layout": "status", "notification_count": 0, "model": "", "provider": "",
 }
 
 #: Face fields forwarded to renderers.  This is an allowlist, so a field a
 #: connector sets but this tuple omits is silently dropped -- which is exactly
 #: how the source logo went missing after being wired up at both ends.
 FACE_KEYS = ("label", "sublabel", "badge", "source", "logo", "color", "icon",
-             "effect", "seen", "layout", "notification_count")
+             "effect", "seen", "layout", "notification_count", "model",
+             "provider")
 
 
 def clean_face(face: dict) -> dict:
@@ -47,7 +48,7 @@ def clean_face(face: dict) -> dict:
         if k in face and face[k] is not None:
             out[k] = face[k]
     # sanity: label/sublabel to str, truncate defensively
-    out["label"] = str(out["label"])[:16]
+    out["label"] = str(out["label"])[:48]
     out["sublabel"] = str(out["sublabel"])[:16]
     # The badge is a corner glyph, so only a couple of characters can ever fit.
     out["badge"] = str(out["badge"])[:2]
@@ -56,9 +57,12 @@ def clean_face(face: dict) -> dict:
     # steer a renderer at an arbitrary path.
     source = str(out["source"])[:32]
     out["source"] = source if re.fullmatch(r"[a-z0-9][a-z0-9-]*", source) else ""
+    provider = str(out["provider"])[:32]
+    out["provider"] = provider if re.fullmatch(r"[a-z0-9][a-z0-9-]*", provider) else ""
+    out["model"] = str(out["model"])[:64]
     if out["effect"] not in ("solid", "breathe", "blink", "shimmer", "off"):
         out["effect"] = "solid"
-    if out["layout"] not in ("status", "logo-only", "icon-action"):
+    if out["layout"] not in ("status", "agent", "logo-only", "icon-action"):
         out["layout"] = "status"
     try:
         out["notification_count"] = max(0, min(999, int(out["notification_count"])))

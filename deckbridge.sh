@@ -10,6 +10,7 @@
 #   ./deckbridge.sh restart
 #   ./deckbridge.sh logs [name]    # tail a component log (default: all)
 #   ./deckbridge.sh doctor         # check prerequisites without starting
+#   ./deckbridge.sh sessions       # each key's model and how long it stays
 #
 # Everything is optional except the hub. Components whose prerequisites are
 # missing are skipped with a reason rather than failing the whole start, so a
@@ -31,7 +32,8 @@ HTTP_PORT="${HTTP_PORT:-8080}"
 KEYS="${KEYS:-15}"
 AGENT_CLAIM="${AGENT_CLAIM:-0 13}"    # sessions 0-9 + fixed shortcuts 10-13
 MIC_KEY="${MIC_KEY:--1}"              # -1 disables; 14 = bottom-right corner
-MAX_AGE_HOURS="${MAX_AGE_HOURS:-24}"  # agents untouched this long drop off
+MAX_AGE_HOURS="${MAX_AGE_HOURS:-24}"  # unseen results stay this long
+REST_HOURS="${REST_HOURS:-2}"         # seen/idle sessions stay this long after you look
 HERMES_SSH="${HERMES_SSH:-}"          # ssh alias for the remote Hermes probe
 DISCORD_CHANNEL_ID="${DISCORD_CHANNEL_ID:-}"
 DISCORD_GUILD_ID="${DISCORD_GUILD_ID:-}"
@@ -342,7 +344,7 @@ start() {
   # 2. unified agents/launchers own 0-9; fixed app shortcuts own 10-13
   # shellcheck disable=SC2086
   spawn connector_agents "$PY" connector_agents.py --claim $AGENT_CLAIM \
-    --port "$WS_PORT" --max-age-hours "$MAX_AGE_HOURS"
+    --port "$WS_PORT" --max-age-hours "$MAX_AGE_HOURS" --rest-hours "$REST_HOURS"
 
   # Native Claude, Codex, and Cursor conversations do not trigger terminal
   # lifecycle hooks. The Accessibility-granted helper exposes their open
@@ -668,5 +670,6 @@ case "${1:-start}" in
   connections) health --full --hw --connections ;;
   logs)    shift || true; logs "$@" ;;
   doctor)  doctor ;;
+  sessions) "$PY" connector_agents.py --once --max-age-hours "$MAX_AGE_HOURS" --rest-hours "$REST_HOURS" ;;
   *) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

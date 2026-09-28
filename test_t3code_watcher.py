@@ -6,12 +6,16 @@ from pathlib import Path
 from unittest import mock
 
 from t3code_watcher import (
-    T3CodeWatcher, annotate_remote_agents, merge_agent_sides,
+    REMOTE_ISSUE_TOKEN, T3CodeWatcher, annotate_remote_agents, merge_agent_sides,
     snapshot_agents, thread_status,
 )
 
 
 class T3CodeWatcherTests(unittest.TestCase):
+    def test_remote_token_script_finds_the_versioned_t3_binary(self):
+        self.assertIn('.t3/runtime/versions/*/t3', REMOTE_ISSUE_TOKEN)
+        self.assertIn('node_modules/t3/dist/bin.mjs', REMOTE_ISSUE_TOKEN)
+
     def test_authoritative_status_mapping(self):
         self.assertEqual(thread_status({"hasPendingUserInput": True}), "blocked")
         self.assertEqual(thread_status({"hasPendingApprovals": True}), "blocked")
@@ -42,17 +46,26 @@ class T3CodeWatcherTests(unittest.TestCase):
         names = [agent["name"] for agent in snapshot_agents(payload, "http://127.0.0.1:3773", "env-1")]
         self.assertEqual(names, ["Still open", "Brought back"])
 
+    def test_snapshot_omits_threads_snoozed_into_the_future(self):
+        payload = {"threads": [
+            {"id": "s1", "title": "Snoozed", "snoozedUntil": "2999-01-01T00:00:00Z"},
+            {"id": "s2", "title": "Woke up", "snoozedUntil": "2000-01-01T00:00:00Z"},
+        ]}
+        names = [a["name"] for a in snapshot_agents(payload, "http://127.0.0.1:3773", "env-1")]
+        self.assertEqual(names, ["Woke up"])
+
     def test_snapshot_uses_title_provider_identity_and_exact_routes(self):
         payload = {
             "projects": [{"id": "p1", "workspaceRoot": "/repo"}],
             "threads": [{
                 "id": "thread-1", "projectId": "p1", "title": "Useful title",
-                "modelSelection": {"instanceId": "claudeAgent"},
+                "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5-5"},
                 "latestTurn": {"state": "completed", "completedAt": "2026-08-13T12:00:00Z"},
             }],
         }
         agents = snapshot_agents(payload, "http://127.0.0.1:3773", "env-1")
         self.assertEqual(agents[0]["name"], "Useful title")
+        self.assertEqual(agents[0]["model"], "claude-opus-5-5")
         self.assertEqual(agents[0]["source"], "t3code-claude")
         self.assertEqual(agents[0]["session_id"], "thread-1")
         self.assertEqual(agents[0]["environment_id"], "env-1")

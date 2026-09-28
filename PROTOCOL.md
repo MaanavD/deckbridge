@@ -51,6 +51,11 @@ grid. Neo is 8. deckd is told `--keys N` (default 15). Each key has a *face*:
   `cc-`/`cx-`/`cu-` prefix. deckd
   whitelists face fields, so a field absent from that whitelist is dropped
   silently — anything new must be added there as well as here.
+- `provider` — optional lab id for the model answering in this session
+  (`anthropic`, `openai`, `xai`, …). Renderers draw
+  `logos/providers/<provider>.svg` in the top-left corner.
+- `model` — optional raw model id (for tooltips); the connector already puts
+  a short model name in `sublabel` unless the key needs attention.
 - `label` / `sublabel` — up to ~8 / ~10 chars; renderer truncates.
 
 Animation remains a renderer concern. A connector describes state, never

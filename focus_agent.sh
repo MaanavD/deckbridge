@@ -1803,7 +1803,7 @@ t3_switch_computer() {
 }
 
 focus_t3code() {
-  local selected polls attempts=0 title64 session64 request result_file front
+  local selected polls attempts=0 title64 session64 computer64 request result_file front hs_bin candidate
   command -v open >/dev/null 2>&1 || return 1
   # A poll-loop `open -a` is what kept yanking T3 to the front. Key presses
   # still need the app, but if it is already showing this thread, do nothing.
@@ -1826,13 +1826,34 @@ focus_t3code() {
   # title. Click that row (largest matching button) before any Settings Back.
   t3_click_thread_tab && return 0
   t3_switch_computer
-  # Prefer Hammerspoon's URL event bridge: LaunchServices delivers this to the
+  # Hammerspoon's CLI works from the LaunchAgent, where the Mic helper's
+  # Accessibility grant is denied. launchd's PATH has no Homebrew, so resolve
+  # hs explicitly, and bound it: hs -c blocks while Hammerspoon reloads.
+  hs_bin=$(command -v hs 2>/dev/null || true)
+  for candidate in /opt/homebrew/bin/hs /usr/local/bin/hs; do
+    [ -n "$hs_bin" ] || { [ -x "$candidate" ] && hs_bin=$candidate; }
+  done
+  if [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] \
+      && [ -n "$hs_bin" ] && command -v base64 >/dev/null 2>&1; then
+    title64=$(printf '%s' "$(t3_thread_title)" | base64 | tr -d '\r\n')
+    session64=$(printf '%s' "$SESSION" | base64 | tr -d '\r\n')
+    computer64=$(printf '%s' "$(t3_computer_label 2>/dev/null)" | base64 | tr -d '\r\n')
+    selected=$(/usr/bin/perl -e 'alarm shift; exec @ARGV' 8 "$hs_bin" -c \
+      "print(deckbridgeT3FocusB64('$title64','$session64','$computer64'))" 2>/dev/null || true)
+    case "$selected" in
+      *"/$SESSION"|*"/$SESSION/"*)
+        printf 'focus_agent: focused exact T3 Code thread %s via Hammerspoon (verified)\n' "$SESSION"
+        return 0
+        ;;
+    esac
+  fi
+  # Fall back to Hammerspoon's URL event bridge: LaunchServices delivers this to the
   # Accessibility-trusted GUI app even when hs's CLI/XPC connection is denied
   # to a LaunchAgent child. A request-scoped result file verifies the route.
   if [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] \
       && command -v base64 >/dev/null 2>&1; then
     title64=$(printf '%s' "$(t3_thread_title)" | base64 | tr '+/' '-_' | tr -d '=\r\n')
-    computer64=$(t3_computer_label 2>/dev/null | base64 | tr '+/' '-_' | tr -d '=\r\n')
+    computer64=$(printf '%s' "$(t3_computer_label 2>/dev/null)" | base64 | tr '+/' '-_' | tr -d '=\r\n')
     request="$$-$(date +%s)"
     result_file="$HOME/.deckbridge/t3-focus-results/$request"
     rm -f "$result_file"
@@ -1855,21 +1876,6 @@ focus_t3code() {
       polls=$((polls + 1))
       sleep 0.05
     done
-  fi
-  # Retain the CLI path for interactive installations whose URL handler has
-  # not loaded yet. It is fast when available and preserves a graceful upgrade.
-  if [ "${DECKBRIDGE_DISABLE_HAMMERSPOON:-0}" != 1 ] \
-      && command -v hs >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then
-    title64=$(printf '%s' "$(t3_thread_title)" | base64 | tr -d '\r\n')
-    session64=$(printf '%s' "$SESSION" | base64 | tr -d '\r\n')
-    computer64=$(t3_computer_label 2>/dev/null | base64 | tr -d '\r\n')
-    selected=$(hs -c "print(deckbridgeT3FocusB64('$title64','$session64','$computer64'))" 2>/dev/null || true)
-    case "$selected" in
-      *"/$SESSION"|*"/$SESSION/"*)
-        printf 'focus_agent: focused exact T3 Code thread %s via Hammerspoon (verified)\n' "$SESSION"
-        return 0
-        ;;
-    esac
   fi
   t3_switch_computer
   t3_click_thread_tab && return 0

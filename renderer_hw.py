@@ -73,6 +73,10 @@ def badge_px(source: str) -> int:
 #: already looking.
 ICON_PX = 22
 LOGO_ONLY_PX = 46
+#: Lab mark drawn inline before the model name on an agent key.
+PROVIDER_PX = 11
+#: Alert icon on an agent key that needs you.
+ALERT_PX = 18
 
 #: Working motion needs enough steps to read as a spin on a 72px display.
 #: Breathe/blink are much slower effects and do not: sending them at this full
@@ -302,16 +306,25 @@ class HWRenderer:
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ]
-        big = small = None
+        sizes = {"font": 15, "font_label": 12, "font_small": 11,
+                 "font_sub": 10, "font_tiny": 9}
+        for name in sizes:
+            setattr(self, name, ImageFont.load_default())
         for c in candidates:
             try:
-                big = ImageFont.truetype(c, 15)
-                small = ImageFont.truetype(c, 11)
+                for name, size in sizes.items():
+                    setattr(self, name, ImageFont.truetype(c, size))
                 break
             except Exception:
                 continue
-        self.font = big or ImageFont.load_default()
-        self.font_small = small or ImageFont.load_default()
+        # A narrow face fits about a quarter more of a task title per line.
+        for narrow in ("/System/Library/Fonts/Supplemental/Arial Narrow.ttf",
+                       "/Library/Fonts/Arial Narrow.ttf"):
+            try:
+                self.font_label = ImageFont.truetype(narrow, 13)
+                break
+            except Exception:
+                continue
 
     # ---- render one key ------------------------------------------------
     def render_face(self, face: dict, phase: float = 1.0, pressed: bool = False):
@@ -400,13 +413,14 @@ class HWRenderer:
         sub = (face.get("sublabel") or "")[:12]
         badge = (face.get("badge") or "")[:2]
 
+        tint = "#%02x%02x%02x" % dim((255, 255, 255), max(0.35, mul))
+        if face.get("layout") == "agent":
+            return self._render_agent(img, draw, face, phase, tint)
+
         cy = 8
         if glyph or icon:
-            # Centre in the width the corner mark leaves free, not in the whole
-            # key.  At w/2 the glyph runs under the mark: harmless with an 18px
-            # letter badge, but the 26px Nous face overlapped "OK" into an
-            # unreadable smear.  Both carry meaning, so neither may be drawn
-            # over the other.
+            # Centre in the width the corner mark leaves free, so the 26px
+            # Nous mark cannot overlap the glyph.
             free = w - badge_px(face.get("source", "")) - 6
             art = logos.load_icon(icon, size=ICON_PX, colour="#ffffff") if icon else None
             if art is None and icon in ("working", "agent"):
@@ -471,7 +485,6 @@ class HWRenderer:
         # factor is part of the cache key rather than applied afterwards.
         source = face.get("source", "")
         px = badge_px(source)
-        tint = "#%02x%02x%02x" % dim((255, 255, 255), max(0.35, mul))
         logo = logos.load(source, size=px, colour=tint) if source else None
         if logo is not None:
             pad = 3
@@ -494,6 +507,79 @@ class HWRenderer:
             )
             draw.text((bx - 3, by + 2), badge, font=self.font_small,
                       anchor="ra", fill="white")
+        return img
+
+    def _corner_mark(self, img, draw, face, phase, tint):
+        source = face.get("source", "")
+        px = badge_px(source)
+        logo = logos.load(source, size=px, colour=tint) if source else None
+        if logo is not None:
+            if face.get("effect") == "shimmer":
+                logo = animate_logo_mark(logo, source, phase)
+            img.paste(logo, (img.width - px - 3, 3), logo)
+        elif face.get("badge"):
+            draw.text((img.width - 4, 4), face["badge"][:2], font=self.font_small,
+                      anchor="ra", fill="white")
+
+    @staticmethod
+    def _wrap(draw, text, font, width, lines=2):
+        """Break ``text`` into at most ``lines`` lines, ending in … if cut."""
+        out: list[str] = []
+        words = text.split()
+        while words and len(out) < lines:
+            line = words.pop(0)
+            while words and draw.textlength(f"{line} {words[0]}", font=font) <= width:
+                line += " " + words.pop(0)
+            out.append(line)
+        if words or any(draw.textlength(l, font=font) > width for l in out):
+            last = out[-1] if out else ""
+            while last and draw.textlength(last + "…", font=font) > width:
+                last = last[:-1]
+            out[-1] = last.rstrip() + "…"
+            out = [l if draw.textlength(l, font=font) <= width else l[:9] + "…"
+                   for l in out]
+        return out
+
+    def _fit_label(self, draw, text, width):
+        """Two lines, cut with an ellipsis; smaller text was unreadable."""
+        return self.font_label, self._wrap(draw, text, self.font_label, width, 2), 14
+
+    def _render_agent(self, img, draw, face, phase, tint):
+        """Alert (only when needed) top-left, home mark top-right, two-line
+        task name, and the lab mark inline with the model on the bottom."""
+        w, h = img.size
+        if face.get("icon"):
+            art = logos.load_icon(face["icon"], size=ALERT_PX, colour=tint)
+            if art is not None:
+                img.paste(art, (4, 4), art)
+            else:
+                draw.text((10, 12), "!", font=self.font, anchor="mm", fill="white")
+        self._corner_mark(img, draw, face, phase, tint)
+
+        font, lines, step = self._fit_label(draw, face.get("label") or "", w - 4)
+        top = 38 - step / 2 * (len(lines) - 1)
+        for i, line in enumerate(lines):
+            draw.text((w / 2, top + step * i), line, font=font,
+                      anchor="mm", fill="white")
+
+        text = (face.get("sublabel") or "").upper()
+        mark = logos.load_provider(face.get("provider", ""), size=PROVIDER_PX,
+                                   colour=tint) if face.get("provider") else None
+        gap = PROVIDER_PX + 2 if mark is not None else 0
+        font = self.font_sub
+        if draw.textlength(text, font=font) + gap > w - 4:
+            font = self.font_tiny
+        if draw.textlength(text, font=font) + gap > w - 4:
+            mark, gap = None, 0
+        # Centre the ink of the caps, not the font's line box, on the mark:
+        # "lm" anchoring leaves room for descenders the caps never use.
+        x = (w - draw.textlength(text, font=font) - gap) / 2
+        centre = h - 10
+        top, bottom = draw.textbbox((0, 0), text or "X", font=font, anchor="ls")[1::2]
+        draw.text((x + gap, centre - (top + bottom) / 2), text, font=font,
+                  anchor="ls", fill=(235, 235, 235))
+        if mark is not None:
+            img.paste(mark, (int(x), round(centre - PROVIDER_PX / 2)), mark)
         return img
 
     def push_all(self, phase: float = 1.0):

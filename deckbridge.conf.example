@@ -15,6 +15,13 @@
 # KEYS=15               # classic Stream Deck has 15 keys
 # AGENT_CLAIM="0 13"    # sessions 0-9, app shortcuts 10-13
 
+# --- how long keys stay --------------------------------------------------------
+# Working and blocked sessions stay while they are alive. A finished result you
+# have not opened stays MAX_AGE_HOURS; once opened (or when idle) it stays
+# REST_HOURS after you last looked. `./deckbridge.sh sessions` shows each key.
+# MAX_AGE_HOURS=24
+# REST_HOURS=2
+
 # --- remote Hermes agents on keys 1-4 ----------------------------------------
 # SSH alias for the box running Hermes. Must work non-interactively:
 #   ssh -o BatchMode=yes hetzner true

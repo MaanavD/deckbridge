@@ -25,6 +25,11 @@ def test_clean_face():
     exactly how the source logo silently failed to reach the deck."""
     out = deckd.clean_face({"label": "x", "source": "claude-code"})
     check("source survives clean_face", out["source"] == "claude-code")
+    model = deckd.clean_face({"provider": "anthropic", "model": "claude-opus-5-5"})
+    check("provider and model survive clean_face",
+          model["provider"] == "anthropic" and model["model"] == "claude-opus-5-5")
+    check("a provider cannot steer a renderer at a path",
+          deckd.clean_face({"provider": "../x"})["provider"] == "")
 
     off = deckd.clean_face({})
     check("missing source defaults to empty", off["source"] == "")

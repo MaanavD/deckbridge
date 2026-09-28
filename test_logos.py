@@ -547,6 +547,25 @@ class TestHardwareRenderer(unittest.TestCase):
         )
         self.assertEqual(img.size, (72, 72))
 
+    def test_agent_layout_wraps_and_marks_the_model(self):
+        r = self.renderer_hw.HWRenderer.__new__(self.renderer_hw.HWRenderer)
+        r.key_size = (72, 72)
+        r._load_fonts()
+        face = connector_agents.face_for({
+            "name": "Improve Model Visibility and Session Retention",
+            "status": "working", "source": "t3code-claude",
+            "model": "claude-opus-5-5",
+        })
+        img = r.render_face(face)
+        self.assertEqual(img.size, (72, 72))
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(img)
+        font, lines, _ = r._fit_label(draw, "Build Muse", 68)
+        self.assertEqual(lines, ["Build Muse"])
+        font, lines, _ = r._fit_label(draw, face["label"], 68)
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[-1].endswith("…"), "text past three lines is cut")
+
     def test_face_without_source_still_renders(self):
         """Old connectors emit no source key at all; that must not crash."""
         r = self.renderer_hw.HWRenderer.__new__(self.renderer_hw.HWRenderer)

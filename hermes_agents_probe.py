@@ -8,13 +8,19 @@ using this stable contract::
                   "status": "working|done|idle", "thread_id": "...",
                   "url": "https://discord.com/channels/<guild>/<thread_id>",
                   "last_activity": "<description or ''>",
-                  "last_activity_at": 0.0, "cwd": "..."}]}
+                  "last_activity_at": 0.0, "cwd": "...",
+                  "profile": "default|work|..."}]}
 
 It never writes to the database.  Discord sessions are filtered to the recent
 window, deduplicated by thread_id (keeping the row with the greatest activity
 time), and ranked with actively-working sessions first.  The status is only a
 best-effort activity status: approval/blocked state is intentionally owned by
 the separate ``hermes_discord_watcher.py``.
+
+Hermes multiplexes profiles. The default profile keeps its database at the
+given path; every extra profile keeps its own under ``profiles/<name>/state.db``
+beside it. Reading only the default database silently hid every work-profile
+thread from the deck, so the probe merges all discoverable profile databases.
 """
 from __future__ import annotations
 
@@ -41,6 +47,12 @@ DEFAULT_SOURCES = ("discord", "cli", "tui")
 DEFAULT_SOURCE = "discord"
 DEFAULT_MAX_AGE_HOURS = 24.0
 BUSY_TIMEOUT_MS = 250
+
+#: Directory, beside the default database, holding one state database per extra
+#: Hermes profile (``profiles/<name>/state.db``).
+PROFILES_DIRNAME = "profiles"
+PROFILE_DB_FILENAME = "state.db"
+DEFAULT_PROFILE = "default"
 
 #: A session whose activity description is nonblank is mid-turn.  Hermes stamps
 #: that description on a heartbeat and clears it when the turn ends, so a stale
@@ -236,13 +248,66 @@ def discord_jump_url(
     return f"https://discord.com/channels/{guild}/{target}"
 
 
-def _row_to_agent(row: sqlite3.Row, *, guild_id: str, now: float) -> dict[str, Any]:
+def profile_db_paths(
+    db_path: str | Path, *, include_profiles: bool = True
+) -> list[tuple[Path, str]]:
+    """Return ``(path, profile)`` for the default DB and every sibling profile.
+
+    The default profile keeps its database at ``db_path``. Extra profiles live
+    under a ``profiles/`` directory next to it, each with its own ``state.db``.
+    A missing or unreadable directory degrades to just the default database, so
+    a host without profiles behaves exactly as before.
+    """
+    main = Path(db_path).expanduser()
+    found: list[tuple[Path, str]] = [(main, DEFAULT_PROFILE)]
+    if not include_profiles:
+        return found
+    try:
+        children = sorted(
+            child for child in (main.parent / PROFILES_DIRNAME).iterdir()
+            if child.is_dir()
+        )
+    except OSError:
+        return found
+    for child in children:
+        candidate = child / PROFILE_DB_FILENAME
+        if candidate.is_file():
+            found.append((candidate, child.name))
+    return found
+
+
+def finished_sessions(connection: sqlite3.Connection, ids: Iterable[str]) -> set[str]:
+    """Sessions whose newest message is a final assistant reply.
+
+    Hermes sometimes leaves "starting new turn" behind after it has answered,
+    which would read as working until the heartbeat grace runs out.
+    """
+    done: set[str] = set()
+    for session_id in ids:
+        try:
+            row = connection.execute(
+                "SELECT role, tool_calls FROM messages WHERE session_id = ? "
+                "ORDER BY id DESC LIMIT 1", (session_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            return done
+        if row and row[0] == "assistant" and not row[1]:
+            done.add(session_id)
+    return done
+
+
+def _row_to_agent(
+    row: sqlite3.Row, *, guild_id: str, now: float, replied: set[str] = frozenset(),
+    profile: str = DEFAULT_PROFILE,
+) -> dict[str, Any]:
     raw_source = str(row["source"] or "").strip().lower()
     source_tag = SOURCE_TAGS.get(raw_source, "hermes-ssh")
     thread_id = "" if row["thread_id"] is None else str(row["thread_id"]).strip()
     chat_id = "" if _row_value(row, "chat_id") is None else str(_row_value(row, "chat_id")).strip()
     title = "" if row["title"] is None else str(row["title"])
     description = "" if row["last_activity_description"] is None else str(row["last_activity_description"])
+    if str(row["id"]) in replied:
+        description = ""
     activity_at = _activity_value(row["last_activity_at"])
     ended = _row_value(row, "ended_at") is not None
     status = infer_status(description, activity_at, now, ended=ended)
@@ -265,6 +330,10 @@ def _row_to_agent(row: sqlite3.Row, *, guild_id: str, now: float) -> dict[str, A
         "last_activity_at": 0.0 if activity_at == float("-inf") else activity_at,
         "cwd": "" if row["cwd"] is None else str(row["cwd"]),
         "source": source_tag,
+        "model": str(_row_value(row, "model") or ""),
+        # The row's own profile wins when present; otherwise it is the profile
+        # directory the row was read from.
+        "profile": str(_row_value(row, "profile_name") or "").strip() or profile,
     }
 
 
@@ -295,6 +364,48 @@ def is_anonymous_discord_bookkeeping_row(row: sqlite3.Row) -> bool:
     ))
 
 
+def _read_rows(
+    path: Path, sources: list[str], cutoff: float,
+) -> tuple[list[sqlite3.Row], set[str]] | None:
+    """Read eligible rows and replied session ids from one state database.
+
+    Returns None when the database cannot be opened or queried, so the caller
+    can tell an unreadable profile apart from an empty one.
+    """
+    placeholders = ", ".join("?" for _ in sources)
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        rows = connection.execute(
+            f"""
+            SELECT *
+            FROM sessions
+            WHERE source IN ({placeholders})
+              AND archived = 0
+              AND last_activity_at IS NOT NULL
+              AND last_activity_at >= ?
+            """,
+            (*sources, cutoff),
+        ).fetchall()
+        replied = finished_sessions(connection, [
+            str(row["id"]) for row in rows
+            if str(row["last_activity_description"] or "").strip()
+        ])
+        return rows, replied
+    except (sqlite3.Error, OSError, ValueError):
+        return None
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+
+
 def probe(
     db_path: str | Path = DEFAULT_DB,
     *,
@@ -304,8 +415,12 @@ def probe(
     max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
     now: float | None = None,
     active_only: bool = True,
+    include_profiles: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Read and rank sessions, returning an empty contract on any DB failure.
+    """Read and rank sessions across the default and every profile DB.
+
+    Returns an empty contract only when no database could be read at all.  A
+    profile that cannot be opened does not hide the sessions in the others.
 
     ``active_only`` drops sessions that are merely stale rather than live.  The
     deck has ten slots and Hermes accumulates hundreds of old threads, so
@@ -330,39 +445,23 @@ def probe(
     sources = [s for s in sources if s]
     if not sources:
         return {"agents": []}
-    placeholders = ", ".join("?" for _ in sources)
 
-    connection: sqlite3.Connection | None = None
-    try:
-        path = str(Path(db_path).expanduser())
-        connection = sqlite3.connect(
-            f"file:{path}?mode=ro", uri=True, timeout=BUSY_TIMEOUT_MS / 1000.0
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-        rows = connection.execute(
-            f"""
-            SELECT id, source, thread_id, title, last_activity_at,
-                   last_activity_description, cwd, ended_at, chat_id
-            FROM sessions
-            WHERE source IN ({placeholders})
-              AND archived = 0
-              AND last_activity_at IS NOT NULL
-              AND last_activity_at >= ?
-            """,
-            (*sources, cutoff),
-        ).fetchall()
-    except (sqlite3.Error, OSError, ValueError):
+    collected: list[tuple[sqlite3.Row, str]] = []
+    replied: set[str] = set()
+    read_any = False
+    for path, profile in profile_db_paths(db_path, include_profiles=include_profiles):
+        result = _read_rows(path, sources, cutoff)
+        if result is None:
+            continue
+        read_any = True
+        rows, rows_replied = result
+        collected.extend((row, profile) for row in rows)
+        replied |= rows_replied
+    if not read_any:
         return {"agents": []}
-    finally:
-        if connection is not None:
-            try:
-                connection.close()
-            except sqlite3.Error:
-                pass
 
-    newest: dict[str, sqlite3.Row] = {}
-    for row in rows:
+    newest: dict[str, tuple[sqlite3.Row, str]] = {}
+    for row, profile in collected:
         if is_anonymous_discord_bookkeeping_row(row):
             continue
         raw_thread_id = row["thread_id"]
@@ -378,12 +477,16 @@ def probe(
                 continue
             key = f"session:{session_id}"
         previous = newest.get(key)
-        if previous is None or _row_precedence(row) > _row_precedence(previous):
-            newest[key] = row
+        if previous is None or _row_precedence(row) > _row_precedence(previous[0]):
+            newest[key] = (row, profile)
 
     ranked = list(newest.values())
     agents = [
-        _row_to_agent(row, guild_id=str(guild_id), now=current) for row in ranked
+        _row_to_agent(
+            row, guild_id=str(guild_id), now=current, replied=replied,
+            profile=profile,
+        )
+        for row, profile in ranked
     ]
     agents = [agent for agent in agents if not is_liveness_probe_session(agent)]
     if active_only:
@@ -412,6 +515,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--all", dest="active_only", action="store_false", default=True,
         help="include idle/stale sessions too (default: active sessions only)",
     )
+    parser.add_argument(
+        "--no-profiles", dest="include_profiles", action="store_false", default=True,
+        help="read only the default DB, ignoring sibling profiles/ databases",
+    )
     return parser.parse_args(argv)
 
 
@@ -424,6 +531,7 @@ def main(argv: list[str] | None = None) -> int:
         source=args.source or DEFAULT_SOURCES,
         max_age_hours=args.max_age_hours,
         active_only=args.active_only,
+        include_profiles=getattr(args, "include_profiles", True),
     )
     json.dump(document, sys.stdout, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.write("\n")

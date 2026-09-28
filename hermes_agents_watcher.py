@@ -39,7 +39,10 @@ from hermes_discord_watcher import fetch_remote_discord_config
 LOG = logging.getLogger("hermes_agents_watcher")
 DEFAULT_DB = "/home/maanav/.hermes/state.db"
 DEFAULT_OUT = Path("~/.deckbridge/hermes_agents.json").expanduser()
-DEFAULT_REMOTE_PROBE = "/home/maanav/deckbridge/hermes_agents_probe.py"
+#: Empty streams this checkout's probe over ssh stdin, so the remote host never
+#: runs a stale copy.
+DEFAULT_REMOTE_PROBE = ""
+PROBE_PATH = Path(__file__).with_name("hermes_agents_probe.py").resolve()
 DEFAULT_INTERVAL = 5.0
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_GUILD_ID = ""
@@ -92,11 +95,11 @@ def build_command(args: argparse.Namespace) -> list[str]:
         # policy can report it and move on instead of accumulating hung ssh
         # children behind an apparently healthy watcher process.
         ssh_options = list(dict.fromkeys([*NONINTERACTIVE_SSH_OPTIONS, *(args.ssh_opt or [])]))
-        command = ["ssh", *ssh_options, args.ssh, "python3", args.remote_probe]
+        command = ["ssh", *ssh_options, args.ssh, "python3", args.remote_probe or "-"]
         return command + probe_args
     return [
         sys.executable,
-        str(Path(__file__).with_name("hermes_agents_probe.py").resolve()),
+        str(PROBE_PATH),
         *probe_args,
     ]
 
@@ -196,9 +199,11 @@ def run_probe(args: argparse.Namespace) -> dict[str, Any]:
     if not str(getattr(args, "guild_id", "") or "").strip():
         args.guild_id = resolve_guild_id(args)
     command = build_command(args)
+    streamed = args.ssh and not args.remote_probe
     try:
         completed = subprocess.run(
             command,
+            input=PROBE_PATH.read_text(encoding="utf-8") if streamed else None,
             check=False,
             capture_output=True,
             text=True,

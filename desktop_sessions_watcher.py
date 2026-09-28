@@ -226,6 +226,7 @@ def parse_claude_session_document(
         "display_title": title,
         "status": "working" if alive else "done",
         "source": "claude-desktop",
+        "model": str(document.get("model") or ""),
         "session_id": route_id,
         "cli_session_id": str(document.get("cliSessionId") or ""),
         "app": "Claude",
