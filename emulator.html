@@ -41,7 +41,15 @@
      mapping. Corner placement leaves the tiny label free for the project
      name. */
   .key .logo { position:absolute; top:4px; right:5px; width:18px; height:18px;
-               filter: drop-shadow(0 1px 2px rgba(0,0,0,.9)); }
+               filter: drop-shadow(0 1px 2px rgba(0,0,0,.9)); z-index:2; }
+  /* Five-hour session level. The colour is what is left: a fresh window
+     fills the key, and it drains from the top as the window is spent. */
+  .key .usage { position:absolute; z-index:1; inset:0; overflow:hidden;
+      background:transparent; pointer-events:none; }
+  .key .usage i { position:absolute; left:0; right:0; bottom:0; height:var(--left, 0%);
+      background:var(--fill, #d97757); }
+  .key .usage.spent i { height:100%; opacity:.55; }
+  .key.off .usage { display:none; }
   .key.logo-only .logo { top:50%; right:auto; left:50%; width:58px; height:58px;
       transform:translate(-50%,-50%); filter:drop-shadow(0 2px 4px rgba(0,0,0,.65)); }
   .key.icon-action .logo { top:43%; right:auto; left:50%; width:52px; height:52px;
@@ -132,7 +140,7 @@
   </div>
 </div>
 <script>
-// deckbridge-emulator-build: 2026-09-27.agent-layout
+// deckbridge-emulator-build: 2026-09-29.usage-meter
 // Probed by deckbridge.sh to tell THIS checkout's emulator from a stale
 // http.server left running in some other directory, which would otherwise
 // answer 404 (or worse, serve old JavaScript) and look like a broken deck.
@@ -159,7 +167,7 @@ function build(keys, gridDims){
     // that comes off the wire is written with textContent or setAttribute
     // below, never as markup.
     k.innerHTML = `<span class="idx">${i}</span>
-      <img class="logo" alt="" hidden><span class="badge"></span><span class="notification"></span><img class="icon" alt="" hidden><span class="label"></span><span class="sub"><img class="provider" alt="" hidden><span class="subtext"></span></span>`;
+      <span class="usage" hidden><i></i></span><img class="logo" alt="" hidden><span class="badge"></span><span class="notification"></span><img class="icon" alt="" hidden><span class="label"></span><span class="sub"><img class="provider" alt="" hidden><span class="subtext"></span></span>`;
     k.addEventListener("mousedown", ()=>send({type:"press",index:i}));
     k.addEventListener("mouseup",   ()=>send({type:"release",index:i}));
     k.addEventListener("mouseleave",e=>{ if(e.buttons) send({type:"release",index:i}); });
@@ -230,7 +238,24 @@ function paint(faces){
     providerEl.onerror = () => { providerEl.hidden = true; };
     if (providerSrc && providerEl.getAttribute("src") !== providerSrc)
       providerEl.setAttribute("src", providerSrc);
-    k.title = f.model || "";
+    const usageEl = k.querySelector(".usage");
+    const usageKnown = f.layout === "logo-only" && f.usage !== null && f.usage !== undefined && f.usage !== "";
+    if (!off && usageKnown) {
+      const used = Math.max(0, Math.min(100, Number(f.usage) || 0));
+      const left = 100 - used;
+      const fill = f.source === "codex-cli" ? "#7a5af8" : "#d97757";
+      usageEl.hidden = false;
+      usageEl.classList.toggle("spent", left <= 0);
+      usageEl.style.setProperty("--left", (left <= 0 ? 100 : left) + "%");
+      usageEl.style.setProperty("--fill", fill);
+      k.title = `5h · ${left}% left`;
+    } else {
+      usageEl.hidden = true;
+      usageEl.classList.remove("spent");
+      usageEl.style.removeProperty("--left");
+      usageEl.style.removeProperty("--fill");
+      k.title = f.model || "";
+    }
     const labelEl = k.querySelector(".label");
     labelEl.textContent = f.label || "";
     k.querySelector(".subtext").textContent = f.sublabel || "";

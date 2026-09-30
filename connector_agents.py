@@ -33,6 +33,8 @@ from typing import Any, Callable, NamedTuple
 
 import websockets
 
+import usage_limits
+
 from connection_runtime import (
     ConnectionHealth,
     HealthReporter,
@@ -529,13 +531,21 @@ def read_shortcuts(path: Path) -> list[dict[str, str]]:
     return _read_button_group(path, "shortcuts", DEFAULT_SHORTCUTS)
 
 
-def launcher_face(app: dict[str, str], notification_count: int = 0) -> dict[str, Any]:
+def launcher_face(
+    app: dict[str, str],
+    notification_count: int = 0,
+    usage: int | None = None,
+) -> dict[str, Any]:
     """Build one key face for a launcher.
 
     Deliberately dim and effect-free.  A launcher is an offer; only an agent
     that needs the operator is allowed to be bright or to animate.
+
+    ``usage`` is the percent of the five-hour window already spent.  Only the
+    Claude and OpenAI launchers have one; other keys omit it so the renderer
+    draws no meter.
     """
-    return {
+    face: dict[str, Any] = {
         "label": "",
         "sublabel": "",
         "badge": "",
@@ -552,6 +562,9 @@ def launcher_face(app: dict[str, str], notification_count: int = 0) -> dict[str,
         "icon": None,
         "effect": "solid",
     }
+    if usage is not None:
+        face["usage"] = max(0, min(100, int(usage)))
+    return face
 
 
 def page_face(page: int, pages: int, hidden: int) -> dict[str, Any]:
@@ -598,6 +611,7 @@ class AgentConnector:
         badge_provider: Any | None = None,
         ack_state: str | os.PathLike[str] | None = None,
         approvals_state: str | os.PathLike[str] | None = None,
+        usage_reader: Callable[[str], int | None] | None = None,
     ) -> None:
         first, last = int(claim[0]), int(claim[1])
         if first < 0 or first > last:
@@ -648,6 +662,10 @@ class AgentConnector:
             Path(os.path.expanduser(os.fspath(ack_state)))
             if ack_state is not None else None
         )
+        # Tests build connectors against temporary feeds and must not read the
+        # operator's Claude keychain or Codex token. The CLI passes the live
+        # reader explicitly.
+        self.usage_reader = usage_reader if usage_reader is not None else (lambda _source: None)
 
         self.ws: Any = None
         # Constructed by tests and config loaders before an event loop exists.
@@ -782,7 +800,8 @@ class AgentConnector:
         for index, app in zip(UTILITY_KEYS, read_shortcuts(self.apps_config)):
             if first <= index <= last:
                 faces[index] = launcher_face(
-                    app, badge_counts.get(app.get("source", ""), 0))
+                    app, badge_counts.get(app.get("source", ""), 0),
+                    self.usage_reader(app.get("source", "")))
                 self._launcher_keys[index] = app
 
         placed = self._slots.assign(
@@ -834,7 +853,8 @@ class AgentConnector:
                 SESSION_LAUNCHER_KEYS, read_launchers(self.apps_config)
             ):
                 if first <= index <= session_last and index not in self._agent_keys:
-                    faces[index] = launcher_face(app)
+                    faces[index] = launcher_face(
+                        app, usage=self.usage_reader(app.get("source", "")))
                     self._launcher_keys[index] = app
         return faces
 
@@ -1243,6 +1263,7 @@ def main(argv: list[str] | None = None) -> int:
         apps_config=args.apps_config,
         launch_cmd=args.launch_cmd,
         health=HealthReporter("connector_agents", stale_after=20.0),
+        usage_reader=usage_limits.session_percent,
         hermes_health=default_health_path("hermes_agents"),
     )
     if args.once:

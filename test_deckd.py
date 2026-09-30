@@ -57,6 +57,16 @@ def test_clean_face():
           deckd.clean_face({"notification_count": 5000})["notification_count"] == 999)
     check("truncated long source is rejected or bounded",
           len(deckd.clean_face({"source": "a" * 99})["source"]) <= 32)
+    check("five-hour usage survives clean_face",
+          deckd.clean_face({"usage": 40})["usage"] == 40)
+    check("a fresh window stays zero rather than unknown",
+          deckd.clean_face({"usage": 0})["usage"] == 0)
+    check("usage is bounded",
+          deckd.clean_face({"usage": 140})["usage"] == 100)
+    check("bad usage is omitted",
+          deckd.clean_face({"usage": "nope"})["usage"] is None)
+    check("a face without usage draws no meter",
+          deckd.clean_face({})["usage"] is None)
 
 
 async def run():

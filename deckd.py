@@ -31,6 +31,7 @@ OFF_FACE = {
     "label": "", "sublabel": "", "badge": "", "source": "", "logo": "",
     "color": "#111111", "icon": None, "effect": "off", "seen": False,
     "layout": "status", "notification_count": 0, "model": "", "provider": "",
+    "usage": None,
 }
 
 #: Face fields forwarded to renderers.  This is an allowlist, so a field a
@@ -38,7 +39,7 @@ OFF_FACE = {
 #: how the source logo went missing after being wired up at both ends.
 FACE_KEYS = ("label", "sublabel", "badge", "source", "logo", "color", "icon",
              "effect", "seen", "layout", "notification_count", "model",
-             "provider")
+             "provider", "usage")
 
 
 def clean_face(face: dict) -> dict:
@@ -68,6 +69,14 @@ def clean_face(face: dict) -> dict:
         out["notification_count"] = max(0, min(999, int(out["notification_count"])))
     except (TypeError, ValueError):
         out["notification_count"] = 0
+    usage = face.get("usage") if isinstance(face, dict) else None
+    if isinstance(usage, bool) or usage is None:
+        out["usage"] = None
+    else:
+        try:
+            out["usage"] = max(0, min(100, int(round(float(usage)))))
+        except (TypeError, ValueError):
+            out["usage"] = None
     return out
 
 

@@ -42,6 +42,12 @@ grid. Neo is 8. deckd is told `--keys N` (default 15). Each key has a *face*:
   `icon-action` centers a large glyph with one compact action caption.
 - `notification_count` — non-negative unread count for a launcher. Renderers
   draw it as a red top-right bubble and display counts above 99 as `99+`.
+- `usage` — optional integer 0–100, the share of the five-hour session window
+  already spent. Present on the Claude and OpenAI launcher keys. Renderers
+  paint what is left: `0` fills the key in the provider colour, and the colour
+  drains from the top as the number rises. The logo sits on top. A missing
+  value draws no level. `100` tints the whole key, so a spent window stays
+  visible.
 - `icon`   — optional name from the shared icon set (agent, discord, check,
   alert, robot, git). Renderer maps name→glyph/image. `null` = text only.
 - `badge`  — optional corner tag, max 2 chars, identifying which tool owns the

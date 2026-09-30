@@ -577,6 +577,40 @@ class TestHardwareRenderer(unittest.TestCase):
         )
         self.assertEqual(img.size, (72, 72))
 
+    def test_logo_only_usage_fills_the_key_background(self):
+        """The five-hour level is what is left, and the logo is pasted over it.
+
+        A fresh window colours the whole key. Half leaves the bottom edge
+        coloured and the top dark. A spent window returns to the launcher colour.
+        """
+        r = self.renderer_hw.HWRenderer.__new__(self.renderer_hw.HWRenderer)
+        r.key_size = (72, 72)
+        r._load_fonts()
+        base = {
+            "source": "claude-code", "color": "#2a2f3a", "effect": "solid",
+            "layout": "logo-only",
+        }
+        plain = r.render_face(dict(base))
+        fresh = r.render_face(dict(base, usage=0))
+        half = r.render_face(dict(base, usage=50))
+        spent = r.render_face(dict(base, usage=100))
+        spent_px = spent.getpixel((2, 70))
+        plain_px = plain.getpixel((2, 70))
+        self.assertNotEqual(spent_px, plain_px)
+        self.assertGreater(spent_px[0], plain_px[0] + 30)
+        red, green, blue = fresh.getpixel((2, 2))
+        self.assertGreater(red, 180)
+        self.assertGreater(red, green)
+        self.assertGreater(red, blue)
+        top = half.getpixel((2, 10))
+        low = half.getpixel((2, 70))
+        self.assertGreater(low[0], top[0] + 40)
+        self.assertEqual(half.getpixel((70, 70)), low)
+        codex = r.render_face(dict(base, source="codex-cli", usage=0))
+        cred, cgreen, cblue = codex.getpixel((2, 2))
+        self.assertGreater(cblue, cred)
+        self.assertGreater(cblue, cgreen)
+
     def test_logo_only_notification_draws_ios_red_bubble(self):
         r = self.renderer_hw.HWRenderer.__new__(self.renderer_hw.HWRenderer)
         r.key_size = (72, 72)

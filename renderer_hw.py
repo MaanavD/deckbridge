@@ -110,6 +110,56 @@ def hex_to_rgb(h: str):
     return tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
 
 
+#: Claude's orange, and OpenAI's purple lifted enough to read on a dark key.
+#: The published OpenAI purple is #412991, which disappears into the launcher.
+USAGE_FILL = {
+    "claude-code": (217, 119, 87),
+    "codex-cli": (122, 90, 248),
+}
+
+
+def _tint_usage(img, color, amount: float) -> None:
+    pixels = img.load()
+    width, height = img.size
+    keep = 1.0 - amount
+    for y in range(height):
+        for x in range(width):
+            pixel = pixels[x, y]
+            pixels[x, y] = tuple(
+                int(pixel[i] * keep + color[i] * amount) for i in range(3)
+            )
+
+
+def usage_fill(source: str):
+    """Provider colour for the five-hour level. Unknown sources stay Claude orange."""
+    return USAGE_FILL.get(source, USAGE_FILL["claude-code"])
+
+
+def draw_usage_meter(img, percent, source: str = "") -> None:
+    """Fill the key from the bottom with how much of the five-hour window is left.
+
+    ``percent`` is the share already spent. A fresh window paints the whole
+    key; the colour drains as that share grows. The product mark is drawn
+    afterwards. A spent window tints the whole key so it does not look unread.
+    """
+    try:
+        used = max(0, min(100, int(percent)))
+    except (TypeError, ValueError):
+        return
+    left = 100 - used
+    width, height = img.size
+    if left <= 0:
+        # A spent window used to match a key with no reading. Tint the whole
+        # face so "nothing left" stays visible.
+        _tint_usage(img, usage_fill(source), 0.55)
+        return
+    fill_h = max(1, round(height * left / 100.0))
+    ImageDraw.Draw(img).rectangle(
+        (0, height - fill_h, width - 1, height - 1),
+        fill=usage_fill(source),
+    )
+
+
 def dim(rgb, mul):
     return tuple(max(0, min(255, int(c * mul))) for c in rgb)
 
@@ -359,10 +409,13 @@ class HWRenderer:
 
         # Inactive launchers are visual muscle-memory targets, not status
         # cards. Give the product mark the whole key and draw no secondary
-        # metadata or corner badge.
+        # metadata or corner badge. A five-hour level, when the face carries
+        # one, is the key background under that mark.
         if face.get("layout") in ("logo-only", "icon-action"):
             action_layout = face.get("layout") == "icon-action"
             source = face.get("source", "")
+            if not action_layout and face.get("usage") is not None:
+                draw_usage_meter(img, face.get("usage"), source)
             logo_size = LOGO_ONLY_PX - 4 if action_layout else LOGO_ONLY_PX
             logo = logos.load(source, size=logo_size, colour="#ffffff")
             if logo is not None:
