@@ -1039,9 +1039,9 @@ def test_long_press_dismisses_and_short_press_focuses() -> None:
 def test_long_press_reflows_survivors_before_launchers_return() -> None:
     """Deleting from a full session row must not preserve a visible hole.
 
-    Six sessions consume keys 0-5 and hide launchers 6-9. Long-holding a
-    middle session brings the launcher row back; the five survivors must be
-    packed into 0-4 first instead of retaining stale keys around the hole.
+    Seven sessions consume keys 0-6 and hide launchers 6-9. Long-holding a
+    middle session brings the launcher row back; the six survivors must be
+    packed into 0-5 first instead of retaining stale keys around the hole.
     """
     now = time.time()
     with tempfile.TemporaryDirectory() as tmp:
@@ -1049,7 +1049,7 @@ def test_long_press_reflows_survivors_before_launchers_return() -> None:
         write(local, [
             {"name": f"session-{i}", "status": "working", "cwd": f"/w/{i}",
              "source": "codex-cli", "updated_at": now}
-            for i in range(6)
+            for i in range(7)
         ])
         c = AgentConnector(claim=(0, 9), hermes_state=Path(tmp) / "none.json",
                            local_state=local)
@@ -1066,7 +1066,7 @@ def test_long_press_reflows_survivors_before_launchers_return() -> None:
         check("long-hold deletion removes the chosen middle session",
               removed_name not in {a["name"] for a in c._agent_keys.values()})
         check("survivors reflow before the launcher row returns",
-              sorted(c._agent_keys) == [0, 1, 2, 3, 4]
+              sorted(c._agent_keys) == [0, 1, 2, 3, 4, 5]
               and sorted(c._launcher_keys) == [6, 7, 8, 9],
               f"agents={sorted(c._agent_keys)} launchers={sorted(c._launcher_keys)}")
 
@@ -1074,7 +1074,7 @@ def test_long_press_reflows_survivors_before_launchers_return() -> None:
         # bug was especially visible after several quick long-holds.
         asyncio.run(delete_middle())
         check("repeated long-hold deletion keeps the board compact",
-              sorted(c._agent_keys) == [0, 1, 2, 3]
+              sorted(c._agent_keys) == [0, 1, 2, 3, 4]
               and sorted(c._launcher_keys) == [6, 7, 8, 9],
               f"agents={sorted(c._agent_keys)} launchers={sorted(c._launcher_keys)}")
 
@@ -1566,7 +1566,7 @@ def test_host_app_reaches_the_focus_command() -> None:
               out.read_text(encoding="utf-8").strip() == "")
 
 
-def test_launchers_persist_until_six_live_sessions() -> None:
+def test_launchers_persist_until_seven_live_sessions() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         state = Path(tmp) / "local.json"
         apps = Path(tmp) / "apps.json"
@@ -1588,9 +1588,22 @@ def test_launchers_persist_until_six_live_sessions() -> None:
             "source": "claude-code", "updated_at": time.time(),
         } for i in range(6)]}), encoding="utf-8")
         faces = c.build_faces(c.collect())
-        check("six live sessions withdraw the whole launcher row",
+        lit = [i for i, f in sorted(faces.items()) if f["effect"] != "off"]
+        check("six live sessions still keep the new-session row",
+              lit == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], repr(lit))
+        check("the launcher keys stay pressable at six sessions",
+              sorted(c._launcher_keys) == [6, 7, 8, 9])
+        check("all six session keys stay pressable beside the launchers",
+              sorted(c._agent_keys) == [0, 1, 2, 3, 4, 5])
+
+        state.write_text(json.dumps({"agents": [{
+            "name": f"session-{i}", "status": "working", "cwd": f"/w/{i}",
+            "source": "claude-code", "updated_at": time.time(),
+        } for i in range(7)]}), encoding="utf-8")
+        faces = c.build_faces(c.collect())
+        check("seven live sessions withdraw the whole launcher row",
               c._launcher_keys == {})
-        check("all six session keys stay pressable", len(c._agent_keys) == 6)
+        check("all seven session keys stay pressable", len(c._agent_keys) == 7)
 
         # ...and they come back when it goes away, so the deck is never dead.
         state.write_text(json.dumps({"agents": []}), encoding="utf-8")
@@ -1995,7 +2008,7 @@ def main() -> int:
     test_tty_reaches_the_focus_command()
     test_herdr_pane_reaches_the_focus_command()
     test_host_app_reaches_the_focus_command()
-    test_launchers_persist_until_six_live_sessions()
+    test_launchers_persist_until_seven_live_sessions()
     test_launcher_config_is_editable_and_forgiving()
     test_fixed_bottom_row_shortcuts()
     test_launcher_press_launches_the_app()

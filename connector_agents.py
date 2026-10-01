@@ -162,8 +162,8 @@ OFF_FACE = {
 }
 
 #: New-session launchers occupy the lower four keys of the session area while
-#: fewer than six sessions are live. At six sessions the complete 0-9 area is
-#: returned to agents. Utility shortcuts on 10-13 never become agent slots.
+#: fewer than seven sessions are live. At seven sessions the complete 0-9 area
+#: is returned to agents. Utility shortcuts on 10-13 never become agent slots.
 #:
 #: ``bundle`` is the macOS application to open.  Editable at
 #: ``~/.deckbridge/apps.json`` as a list of the same three fields, because the
@@ -217,7 +217,7 @@ DEFAULT_SHORTCUTS = [
 ]
 SESSION_LAUNCHER_KEYS = (6, 7, 8, 9)
 UTILITY_KEYS = (10, 11, 12, 13)
-LAUNCHERS_HIDE_AT = 6
+LAUNCHERS_HIDE_AT = 7
 DEFAULT_APPS_CONFIG = "~/.deckbridge/apps.json"
 DEFAULT_LAUNCH_CMD = "./focus_agent.sh --launch {bundle}"
 
@@ -845,7 +845,7 @@ class AgentConnector:
             self._agent_keys.pop(session_last, None)
             self._page_key = session_last
 
-        # Keep the new-session row visible during ordinary use. Once the sixth
+        # Keep the new-session row visible during ordinary use. Once the seventh
         # live session arrives, withdraw all four together so the session area
         # has one stable meaning and the new session can take its pinned slot.
         if total < LAUNCHERS_HIDE_AT:

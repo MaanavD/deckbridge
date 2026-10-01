@@ -44,12 +44,12 @@ The reference layout targets the classic 15-key Stream Deck:
 
 ```text
 0–9    live agent sessions
-6–9    launchers while fewer than six sessions are visible
+6–9    launchers while fewer than seven sessions are visible
 10–13  fixed app shortcuts
 14     hold-to-talk microphone
 ```
 
-Launchers and shortcuts are icon-only while inactive. At six or more live
+Launchers and shortcuts are icon-only while inactive. At seven or more live
 sessions, keys 6–9 become session keys; the launcher row returns and the board
 re-sorts when capacity is available again.
 
