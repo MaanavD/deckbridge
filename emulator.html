@@ -48,7 +48,7 @@
       background:transparent; pointer-events:none; }
   .key .usage i { position:absolute; left:0; right:0; bottom:0; height:var(--left, 0%);
       background:var(--fill, #d97757); }
-  .key .usage.spent i { height:100%; opacity:.55; }
+  .key .usage.spent { display:none; }
   .key.off .usage { display:none; }
   .key.logo-only .logo { top:50%; right:auto; left:50%; width:58px; height:58px;
       transform:translate(-50%,-50%); filter:drop-shadow(0 2px 4px rgba(0,0,0,.65)); }
@@ -243,12 +243,20 @@ function paint(faces){
     if (!off && usageKnown) {
       const used = Math.max(0, Math.min(100, Number(f.usage) || 0));
       const left = 100 - used;
-      const fill = f.source === "codex-cli" ? "#7a5af8" : "#d97757";
-      usageEl.hidden = false;
+      const fills = {
+        "claude-code": "#d97757",
+        "codex-cli": "#7a5af8",
+        "hermes-discord": "#2ec4b6",
+        "t3code": "#4c9aff",
+      };
+      const fill = fills[f.source] || "#d97757";
+      const windowLabel = f.source === "t3code" ? "plan"
+        : f.source === "codex-cli" ? "week" : "5h";
+      usageEl.hidden = left <= 0;
       usageEl.classList.toggle("spent", left <= 0);
-      usageEl.style.setProperty("--left", (left <= 0 ? 100 : left) + "%");
+      usageEl.style.setProperty("--left", left + "%");
       usageEl.style.setProperty("--fill", fill);
-      k.title = `5h · ${left}% left`;
+      k.title = `${windowLabel} · ${left}% left`;
     } else {
       usageEl.hidden = true;
       usageEl.classList.remove("spent");

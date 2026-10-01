@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Five-hour subscription usage for the Claude and OpenAI launcher keys.
+"""Subscription usage for the four launcher keys.
 
-The number on the key is how much of the current five-hour session window is
-already spent, 0–100. Codex reads it from the local Codex login. Claude
-reads it from the Claude Code keychain login, refreshing that token when it
-has expired.
+The number on a key is how much of that allowance is already spent, 0–100.
+Claude and OpenCode Go are five-hour session windows. Codex is the weekly
+plan. Cursor is the monthly plan, drawn on the T3 key, and OpenCode is drawn
+on the Nous key. Each one is read from that product's own login.
 """
 from __future__ import annotations
 
 import getpass
 import json
 import logging
+import os
 import subprocess
 import time
 import urllib.error
@@ -22,7 +23,11 @@ log = logging.getLogger("usage_limits")
 
 CLAUDE_SOURCE = "claude-code"
 CODEX_SOURCE = "codex-cli"
-SESSION_SOURCES = (CLAUDE_SOURCE, CODEX_SOURCE)
+#: The Nous mark on the Discord launcher stands in for OpenCode Go.
+OPENCODE_SOURCE = "hermes-discord"
+#: The T3 launcher stands in for Cursor's plan.
+CURSOR_SOURCE = "t3code"
+SESSION_SOURCES = (CLAUDE_SOURCE, CODEX_SOURCE, OPENCODE_SOURCE, CURSOR_SOURCE)
 
 CLAUDE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 CLAUDE_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
@@ -31,8 +36,16 @@ CLAUDE_BETA = "oauth-2025-04-20"
 CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
-#: Codex names the five-hour bucket ``primary``; 18000s is that window.
+#: Some Codex plans still have a five-hour ``primary``. Others, including this
+#: one, make ``primary`` the weekly allowance (604800s) and leave the
+#: five-hour bucket at zero.
 CODEX_SESSION_SECONDS = 5 * 60 * 60
+CODEX_WEEK_SECONDS = 7 * 24 * 60 * 60
+
+OPENCODE_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+CURSOR_USAGE_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+CURSOR_KEYCHAIN_SERVICE = "cursor-access-token"
+CURSOR_KEYCHAIN_ACCOUNT = "cursor-user"
 
 CACHE_TTL_S = 60.0
 _cache: dict[str, tuple[float, Optional[int], float]] = {}
@@ -86,29 +99,87 @@ def claude_session_percent(payload: Any) -> tuple[Optional[int], float]:
     return used, iso_epoch(window.get("resets_at"))
 
 
-def codex_session_percent(payload: Any) -> tuple[Optional[int], float]:
-    """Parse Codex's wham usage body. ``primary_window`` is the five-hour bucket."""
-    if not isinstance(payload, dict):
-        return None, 0.0
-    rate = payload.get("rate_limit")
-    if not isinstance(rate, dict):
-        return None, 0.0
-    window = rate.get("primary_window")
+def _codex_window_seconds(window: dict[str, Any]) -> Optional[int]:
+    try:
+        return int(window.get("limit_window_seconds"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _codex_window_reading(window: Any) -> tuple[Optional[int], float]:
     if not isinstance(window, dict):
         return None, 0.0
-    seconds = window.get("limit_window_seconds")
-    if seconds is not None:
-        try:
-            if int(seconds) != CODEX_SESSION_SECONDS:
-                return None, 0.0
-        except (TypeError, ValueError):
-            return None, 0.0
+    used = clamp_percent(window.get("used_percent"))
+    if used is None:
+        return None, 0.0
     reset_at = window.get("reset_at")
     try:
         resets = float(reset_at) if reset_at else 0.0
     except (TypeError, ValueError):
         resets = 0.0
-    return clamp_percent(window.get("used_percent")), resets
+    return used, resets
+
+
+def codex_session_percent(payload: Any) -> tuple[Optional[int], float]:
+    """Parse Codex usage, preferring the weekly plan over an idle five-hour bucket.
+
+    A five-hour ``primary`` at zero used to hide the weekly allowance, which
+    is the plan that actually drains.
+    """
+    if not isinstance(payload, dict):
+        return None, 0.0
+    rate = payload.get("rate_limit")
+    if not isinstance(rate, dict):
+        return None, 0.0
+    primary = rate.get("primary_window")
+    secondary = rate.get("secondary_window")
+    for window in (primary, secondary):
+        if not isinstance(window, dict):
+            continue
+        if _codex_window_seconds(window) == CODEX_WEEK_SECONDS:
+            return _codex_window_reading(window)
+    return _codex_window_reading(primary)
+
+
+def opencode_session_percent(payload: Any) -> tuple[Optional[int], float]:
+    """Parse OpenCode Go usage. ``rolling`` is the five-hour window.
+
+    A body with no rolling window has not started that clock, so nothing is
+    spent yet.
+    """
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict) or "rolling" not in usage or usage.get("rolling") is None:
+        return 0, 0.0
+    window = usage.get("rolling")
+    if not isinstance(window, dict):
+        return None, 0.0
+    used = clamp_percent(window.get("percent"))
+    if used is None:
+        return 0, 0.0
+    return used, iso_epoch(window.get("resetsAt"))
+
+
+def cursor_plan_percent(payload: Any) -> tuple[Optional[int], float]:
+    """Parse Cursor's current billing period. ``totalPercentUsed`` is the plan."""
+    if not isinstance(payload, dict):
+        return None, 0.0
+    plan = payload.get("planUsage")
+    if not isinstance(plan, dict):
+        return None, 0.0
+    used = clamp_percent(plan.get("totalPercentUsed"))
+    if used is None:
+        return None, 0.0
+    resets = 0.0
+    raw = payload.get("billingCycleEnd")
+    try:
+        stamp = float(raw)
+    except (TypeError, ValueError):
+        stamp = 0.0
+    if stamp > 1e12:
+        resets = stamp / 1000.0
+    elif stamp > 1e9:
+        resets = stamp
+    return used, resets
 
 
 def fresh_percent(percent: Optional[int], resets_at: float, now: float) -> Optional[int]:
@@ -139,10 +210,6 @@ def session_percent(source: str, now: Optional[float] = None) -> Optional[int]:
         if kept is not None:
             _cache[source] = (current, cached[1], cached[2], current + hold_for)
             return kept
-    # A failed read with no open window is the resting state: the five-hour
-    # clock has not started, so the allowance is still full.
-    if percent is None and source == CLAUDE_SOURCE:
-        percent, resets = 0, 0.0
     _cache[source] = (current, percent, resets, current + hold_for)
     return fresh_percent(percent, resets, current)
 
@@ -156,6 +223,12 @@ def _probe(source: str) -> tuple[Optional[int], float, float]:
     try:
         if source == CLAUDE_SOURCE:
             return _probe_claude()
+        if source == OPENCODE_SOURCE:
+            percent, resets = _probe_opencode()
+            return percent, resets, CACHE_TTL_S
+        if source == CURSOR_SOURCE:
+            percent, resets = _probe_cursor()
+            return percent, resets, CACHE_TTL_S
         percent, resets = _probe_codex()
         return percent, resets, CACHE_TTL_S
     except Exception:
@@ -276,9 +349,8 @@ def _probe_claude() -> tuple[Optional[int], float, float]:
     document = _read_claude_document()
     if document is None:
         return None, 0.0, CACHE_TTL_S
-    # Ask with the saved token first. Refreshing on the clock alone was
-    # failing, and a 429 from this endpoint means "ask again later", not
-    # "the five-hour allowance is gone".
+    # Ask with the saved token first. The usage service answers a Claude Code
+    # client; without that agent it often returns 429 and hides a spent window.
     token = str((document.get("claudeAiOauth") or {}).get("accessToken") or "")
     if not token:
         return None, 0.0, CACHE_TTL_S
@@ -290,9 +362,11 @@ def _probe_claude() -> tuple[Optional[int], float, float]:
             return None, 0.0, CACHE_TTL_S
         status, body, retry = _fetch_claude_usage(token)
     if status == 429:
+        # A rate-limit answer with no percent is the session being blocked.
+        # Painting that as a full key is how a spent Claude window looked unused.
         wait = min(max(retry or 300.0, 60.0), 30 * 60)
-        log.info("claude usage endpoint asked for a pause of %.0fs", wait)
-        return None, 0.0, wait
+        log.info("claude usage is blocked; treating the session as spent for %.0fs", wait)
+        return 100, time.time() + wait, wait
     if status != 200:
         log.warning("claude usage read failed (HTTP %s)", status)
         return None, 0.0, CACHE_TTL_S
@@ -306,6 +380,8 @@ def _fetch_claude_usage(token: str) -> tuple[int, Any, float]:
         {
             "Authorization": "Bearer " + token,
             "anthropic-beta": CLAUDE_BETA,
+            "Accept": "application/json",
+            "User-Agent": "claude-code/2.1.281",
         },
     )
 
@@ -336,3 +412,74 @@ def _probe_codex() -> tuple[Optional[int], float]:
         log.warning("codex usage read failed (HTTP %s)", status)
         return None, 0.0
     return codex_session_percent(body)
+
+
+def _opencode_api_key() -> str:
+    data_home = os.environ.get("XDG_DATA_HOME")
+    root = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    path = root / "opencode" / "auth.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    entry = document.get("opencode-go") if isinstance(document, dict) else None
+    if not isinstance(entry, dict) or entry.get("type") != "api":
+        return ""
+    key = entry.get("key")
+    return key.strip() if isinstance(key, str) else ""
+
+
+def _probe_opencode() -> tuple[Optional[int], float]:
+    key = _opencode_api_key()
+    if not key:
+        return None, 0.0
+    status, body, _retry = _http_json(
+        OPENCODE_USAGE_URL,
+        {
+            "Authorization": "Bearer " + key,
+            "Accept": "application/json",
+            # Cloudflare rejects the default Python client.
+            "User-Agent": "opencode",
+        },
+    )
+    if status != 200:
+        log.warning("opencode usage read failed (HTTP %s)", status)
+        return None, 0.0
+    return opencode_session_percent(body)
+
+
+def _cursor_access_token() -> str:
+    try:
+        token = subprocess.check_output(
+            [
+                "security", "find-generic-password",
+                "-s", CURSOR_KEYCHAIN_SERVICE,
+                "-a", CURSOR_KEYCHAIN_ACCOUNT,
+                "-w",
+            ],
+            text=True, stderr=subprocess.DEVNULL, timeout=5,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return token
+
+
+def _probe_cursor() -> tuple[Optional[int], float]:
+    token = _cursor_access_token()
+    if not token:
+        return None, 0.0
+    status, body, _retry = _http_json(
+        CURSOR_USAGE_URL,
+        {
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+            "connect-protocol-version": "1",
+            "x-cursor-client-type": "cli",
+            "User-Agent": "cursor-agent",
+        },
+        body=b"{}",
+    )
+    if status != 200:
+        log.warning("cursor usage read failed (HTTP %s)", status)
+        return None, 0.0
+    return cursor_plan_percent(body)

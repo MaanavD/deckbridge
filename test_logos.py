@@ -581,7 +581,7 @@ class TestHardwareRenderer(unittest.TestCase):
         """The five-hour level is what is left, and the logo is pasted over it.
 
         A fresh window colours the whole key. Half leaves the bottom edge
-        coloured and the top dark. A spent window returns to the launcher colour.
+        coloured and the top dark. A spent window keeps the launcher colour.
         """
         r = self.renderer_hw.HWRenderer.__new__(self.renderer_hw.HWRenderer)
         r.key_size = (72, 72)
@@ -594,10 +594,10 @@ class TestHardwareRenderer(unittest.TestCase):
         fresh = r.render_face(dict(base, usage=0))
         half = r.render_face(dict(base, usage=50))
         spent = r.render_face(dict(base, usage=100))
-        spent_px = spent.getpixel((2, 70))
         plain_px = plain.getpixel((2, 70))
-        self.assertNotEqual(spent_px, plain_px)
-        self.assertGreater(spent_px[0], plain_px[0] + 30)
+        self.assertEqual(spent.getpixel((2, 70)), plain_px)
+        codex_spent = r.render_face(dict(base, source="codex-cli", usage=100))
+        self.assertEqual(codex_spent.getpixel((2, 70)), plain_px)
         red, green, blue = fresh.getpixel((2, 2))
         self.assertGreater(red, 180)
         self.assertGreater(red, green)

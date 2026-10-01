@@ -115,23 +115,16 @@ def hex_to_rgb(h: str):
 USAGE_FILL = {
     "claude-code": (217, 119, 87),
     "codex-cli": (122, 90, 248),
+    # OpenCode teal on the Nous key, Cursor blue on the T3 key. Both are
+    # bright enough to read on the dark launcher, and neither is the deck's
+    # status blue or the OpenAI purple.
+    "hermes-discord": (46, 196, 182),
+    "t3code": (76, 154, 255),
 }
 
 
-def _tint_usage(img, color, amount: float) -> None:
-    pixels = img.load()
-    width, height = img.size
-    keep = 1.0 - amount
-    for y in range(height):
-        for x in range(width):
-            pixel = pixels[x, y]
-            pixels[x, y] = tuple(
-                int(pixel[i] * keep + color[i] * amount) for i in range(3)
-            )
-
-
 def usage_fill(source: str):
-    """Provider colour for the five-hour level. Unknown sources stay Claude orange."""
+    """Provider colour for the allowance still left. Unknown sources stay Claude orange."""
     return USAGE_FILL.get(source, USAGE_FILL["claude-code"])
 
 
@@ -140,19 +133,16 @@ def draw_usage_meter(img, percent, source: str = "") -> None:
 
     ``percent`` is the share already spent. A fresh window paints the whole
     key; the colour drains as that share grows. The product mark is drawn
-    afterwards. A spent window tints the whole key so it does not look unread.
+    afterwards. A spent window draws nothing, so the key stays its own colour.
     """
     try:
         used = max(0, min(100, int(percent)))
     except (TypeError, ValueError):
         return
     left = 100 - used
-    width, height = img.size
     if left <= 0:
-        # A spent window used to match a key with no reading. Tint the whole
-        # face so "nothing left" stays visible.
-        _tint_usage(img, usage_fill(source), 0.55)
         return
+    width, height = img.size
     fill_h = max(1, round(height * left / 100.0))
     ImageDraw.Draw(img).rectangle(
         (0, height - fill_h, width - 1, height - 1),
